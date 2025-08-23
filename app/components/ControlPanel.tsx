@@ -159,6 +159,33 @@ export function ControlPanel({
             onChange={(e) => setControls({ invertStrategy: e.target.checked })}
           />
         </Row>
+        <Row
+          label="Roulette Mode"
+          hint="Switch UI to Roulette inputs (Red/Black or Dozens modes)."
+        >
+          <input
+            type="checkbox"
+            checked={controls.mode === "roulette"}
+            onChange={(e) =>
+              setControls({ mode: e.target.checked ? "roulette" : "binary" })
+            }
+          />
+        </Row>
+        {controls.mode === "roulette" && (
+          <Row
+            label="Variant"
+            hint="Choose Red/Black (binary) or Dozens (1st/2nd/3rd 12)."
+          >
+            <select
+              value={controls.rouletteVariant}
+              onChange={(e) => setControls({ rouletteVariant: e.target.value })}
+              className="bg-slate-900/70 border border-slate-600 rounded px-2 py-1 text-[11px]"
+            >
+              <option value="redblack">Red/Black</option>
+              <option value="dozens">Dozens</option>
+            </select>
+          </Row>
+        )}
         <button
           onClick={resetModel}
           disabled={loading}

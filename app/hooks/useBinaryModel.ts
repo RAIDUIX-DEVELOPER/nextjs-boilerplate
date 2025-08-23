@@ -37,6 +37,35 @@ export function useBinaryModel() {
   const [probOver, setProbOver] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [backend, setBackend] = useState<string | null>(null);
+  // Roulette dozens mode state (separate simple frequency tracker)
+  const [dozenHistory, setDozenHistory] = useState<(0 | 1 | 2)[]>([]);
+  const dozenProbsRef = useRef<[number, number, number] | null>(null);
+  // Multi-class (dozens) model & tracking
+  const dozenModelRef = useRef<tf.LayersModel | null>(null);
+  const dozenPredictionRef = useRef<{
+    probs: [number, number, number] | null;
+    predLabel: 0 | 1 | 2 | null;
+  }>({ probs: null, predLabel: null });
+  // Heuristic tracking for dozens
+  const dozenMarkovRef = useRef([
+    [1, 1, 1],
+    [1, 1, 1],
+    [1, 1, 1],
+  ]);
+  const dozenRunPostRef = useRef<Record<string, { cont: number; rev: number }>>(
+    {}
+  );
+  const dozenEwmaRef = useRef<[number, number, number] | null>(null);
+  const dozenAccRef = useRef({ correct: 0, total: 0 });
+  interface DozenRecord {
+    label: 0 | 1 | 2;
+    predLabel: 0 | 1 | 2 | null;
+    probs: [number, number, number] | null;
+    correct: boolean | null;
+  }
+  const [dozenRecords, setDozenRecords] = useState<DozenRecord[]>([]);
+  // Version bump to force UI re-render when dozens prediction/probs update
+  const [dozenVersion, setDozenVersion] = useState(0);
   const modelRef = useRef<tf.LayersModel | null>(null);
   const markovCountsRef = useRef([
     [1, 1],
@@ -207,6 +236,86 @@ export function useBinaryModel() {
     return modelRef.current;
   }, [featureCount]);
 
+  // === Dozens (multi-class) model helpers ===
+  const dozenFeatureCount = 11; // one-hot(3) + runLen + transition + freq(3) + timeSince(3)
+  const buildDozenModel = () => {
+    const m = tf.sequential();
+    m.add(
+      tf.layers.inputLayer({ inputShape: [windowSize, dozenFeatureCount] })
+    );
+    m.add(
+      tf.layers.conv1d({
+        filters: 24,
+        kernelSize: 3,
+        activation: "relu",
+        padding: "same",
+      })
+    );
+    m.add(
+      tf.layers.conv1d({
+        filters: 16,
+        kernelSize: 5,
+        activation: "relu",
+        padding: "same",
+      })
+    );
+    m.add(tf.layers.dropout({ rate: 0.15 }));
+    m.add(tf.layers.globalAveragePooling1d());
+    m.add(tf.layers.dense({ units: 24, activation: "relu" }));
+    m.add(tf.layers.dense({ units: 3, activation: "softmax" }));
+    m.compile({
+      optimizer: tf.train.adam(0.001),
+      loss: "categoricalCrossentropy",
+    });
+    return m;
+  };
+  const ensureDozenModel = useCallback(async () => {
+    if (!dozenModelRef.current) dozenModelRef.current = buildDozenModel();
+    return dozenModelRef.current;
+  }, []);
+
+  const buildDozenFeatureWindow = useCallback(
+    (seq: (0 | 1 | 2)[]): number[][] => {
+      const feats: number[][] = [];
+      if (!seq.length) return feats;
+      let runLen = 1;
+      const timeSince = [0, 0, 0];
+      let last = seq[0];
+      const freqCounts = [0, 0, 0];
+      for (let i = 0; i < seq.length; i++) {
+        const v = seq[i];
+        freqCounts[v] += 1;
+        if (i > 0) {
+          if (v === last) runLen += 1;
+          else {
+            runLen = 1;
+            last = v;
+          }
+        }
+        for (let k = 0; k < 3; k++) {
+          if (k === v) timeSince[k] = 0;
+          else timeSince[k] += 1;
+        }
+        const window10 = seq.slice(Math.max(0, i - 9), i + 1);
+        const freq10 = [0, 0, 0];
+        window10.forEach((x) => (freq10[x] += 1));
+        const f10 = freq10.map((c) => c / window10.length);
+        const oneHot = [v === 0 ? 1 : 0, v === 1 ? 1 : 0, v === 2 ? 1 : 0];
+        feats.push([
+          ...oneHot, // 3
+          Math.min(runLen / 20, 1), // 1
+          i > 0 && seq[i - 1] !== v ? 1 : 0, // 1
+          ...f10, // 3
+          Math.min(timeSince[0] / 20, 1),
+          Math.min(timeSince[1] / 20, 1),
+          Math.min(timeSince[2] / 20, 1), // 3
+        ]);
+      }
+      return feats;
+    },
+    []
+  );
+
   // Stable memoized feature builder (prevents effect dependency churn -> retrain loop)
   const buildFeatureWindow = useCallback((seq: number[]): number[][] => {
     const feats: number[][] = [];
@@ -302,7 +411,10 @@ export function useBinaryModel() {
     bayesPriorA: 1,
     bayesPriorB: 1,
     entropyWindow: 20,
+    mode: "binary" as "binary" | "roulette", // UI mode toggle
+    rouletteVariant: "redblack" as "redblack" | "dozens",
   });
+  const [controlsVersion, setControlsVersion] = useState(0);
 
   const computeBayes = (a0: number, b0: number, seq: number[]) => {
     const sum = seq.reduce((a, b) => a + b, 0);
@@ -655,11 +767,14 @@ export function useBinaryModel() {
           "bayesPriorA",
           "bayesPriorB",
           "entropyWindow",
+          "mode",
+          "rouletteVariant",
         ].includes(k)
       )
     ) {
       recomputeCurrentProb();
     }
+    setControlsVersion((v) => v + 1); // force re-render for ref consumers
   };
 
   const lastTrainCountRef = useRef(0);
@@ -729,6 +844,338 @@ export function useBinaryModel() {
     ensureModel,
     recomputeCurrentProb,
   ]);
+
+  // Dozens training loop (multi-class)
+  const dozenLastTrainRef = useRef(0);
+  const DOZEN_TRAIN_START = 5; // begin adapting after 5 spins
+  const DOZEN_TRAIN_EVERY = 1; // adapt every sample once enough data
+  // track prediction streak to damp persistent bias
+  const dozenPredStreakRef = useRef<{ last: number | null; len: number }>({
+    last: null,
+    len: 0,
+  });
+  const trainAndPredictDozens = useCallback(async () => {
+    const m = await ensureDozenModel();
+    // If insufficient history for a window, still output a uniform distribution so UI has stable values.
+    if (dozenHistory.length === 0) {
+      const uniform: [number, number, number] = [1 / 3, 1 / 3, 1 / 3];
+      dozenProbsRef.current = uniform;
+      dozenPredictionRef.current = { probs: uniform, predLabel: 0 };
+      setDozenVersion((v) => v + 1);
+      return;
+    }
+    if (
+      dozenHistory.length >= DOZEN_TRAIN_START &&
+      dozenHistory.length % DOZEN_TRAIN_EVERY === 0 &&
+      dozenHistory.length !== dozenLastTrainRef.current &&
+      dozenHistory.length > windowSize
+    ) {
+      const xsArr: number[][][] = [];
+      const ysArr: number[][] = [];
+      for (let i = 0; i < dozenHistory.length - windowSize; i++) {
+        const win = dozenHistory.slice(i, i + windowSize) as (0 | 1 | 2)[];
+        const y = dozenHistory[i + windowSize];
+        xsArr.push(buildDozenFeatureWindow(win));
+        const oneHot: [number, number, number] = [0, 0, 0];
+        oneHot[y] = 1;
+        ysArr.push(oneHot);
+      }
+      if (xsArr.length) {
+        const xs = tf.tensor3d(xsArr);
+        const ys = tf.tensor2d(ysArr);
+        await m.fit(xs, ys, {
+          epochs: 1,
+          verbose: 0,
+          batchSize: Math.min(16, xsArr.length),
+        });
+        xs.dispose();
+        ys.dispose();
+        dozenLastTrainRef.current = dozenHistory.length;
+      }
+    }
+    const counts = [0, 0, 0];
+    dozenHistory.forEach((v) => (counts[v] += 1));
+    const dirichlet = counts.map(
+      (c) => (c + 1) / (dozenHistory.length + 3)
+    ) as [number, number, number];
+    let modelProbs: [number, number, number] | null = null;
+    if (dozenHistory.length >= windowSize) {
+      modelProbs = tf.tidy(() => {
+        const lastWin = dozenHistory.slice(-windowSize) as (0 | 1 | 2)[];
+        const feats = buildDozenFeatureWindow(lastWin);
+        const t = tf.tensor3d([feats]);
+        const out = m.predict(t) as tf.Tensor;
+        const arr = Array.from(out.dataSync()) as [number, number, number];
+        t.dispose();
+        out.dispose();
+        return arr;
+      });
+    }
+    // Markov distribution
+    let markovDist: [number, number, number] = [1 / 3, 1 / 3, 1 / 3];
+    if (dozenHistory.length >= 2) {
+      const last = dozenHistory[dozenHistory.length - 1];
+      const row = dozenMarkovRef.current[last];
+      const s = row[0] + row[1] + row[2];
+      markovDist = [row[0] / s, row[1] / s, row[2] / s] as [
+        number,
+        number,
+        number
+      ];
+    }
+    // Run-length continuation vs reversal (streak) + pattern similar
+    let streakDist: [number, number, number] = [1 / 3, 1 / 3, 1 / 3];
+    let patternDist: [number, number, number] = [1 / 3, 1 / 3, 1 / 3];
+    if (dozenHistory.length >= 2) {
+      const last = dozenHistory[dozenHistory.length - 1];
+      let rl = 1;
+      for (let i = dozenHistory.length - 2; i >= 0; i--) {
+        if (dozenHistory[i] === last) rl++;
+        else break;
+      }
+      const key = `${last}:${rl}`;
+      const rec = dozenRunPostRef.current[key];
+      let contP = 0.5;
+      if (rec) contP = (rec.cont + 1) / (rec.cont + rec.rev + 2);
+      const otherShare = (1 - contP) / 2;
+      streakDist = [0, 1, 2].map((c) => (c === last ? contP : otherShare)) as [
+        number,
+        number,
+        number
+      ];
+      // Pattern: look at distribution of past run lengths for this class; compute probability continuation probability similar to binary longer run heuristic
+      const runs: number[] = [];
+      let cur = 1;
+      for (let i = dozenHistory.length - 2; i >= 0; i--) {
+        if (dozenHistory[i] === dozenHistory[i + 1]) cur++;
+        else {
+          runs.push(cur);
+          cur = 1;
+        }
+      }
+      runs.push(cur);
+      const matchingRuns = runs.filter((r) => r > rl).length + 1;
+      const totalRuns = runs.length + 2;
+      const pCont = matchingRuns / totalRuns;
+      const pOther = (1 - pCont) / 2;
+      patternDist = [0, 1, 2].map((c) => (c === last ? pCont : pOther)) as [
+        number,
+        number,
+        number
+      ];
+    }
+    // EWMA per class
+    if (!dozenEwmaRef.current) {
+      const s = counts[0] + counts[1] + counts[2];
+      if (s === 0) {
+        dozenEwmaRef.current = [1 / 3, 1 / 3, 1 / 3];
+      } else {
+        dozenEwmaRef.current = [
+          counts[0] / s,
+          counts[1] / s,
+          counts[2] / s,
+        ] as [number, number, number];
+      }
+    }
+    const alpha = controlsRef.current.ewmaAlpha;
+    const total = counts[0] + counts[1] + counts[2];
+    const inst: [number, number, number] = total
+      ? [counts[0] / total, counts[1] / total, counts[2] / total]
+      : [1 / 3, 1 / 3, 1 / 3];
+    dozenEwmaRef.current = [0, 1, 2].map(
+      (i) => (1 - alpha) * (dozenEwmaRef.current as any)[i] + alpha * inst[i]
+    ) as [number, number, number];
+    const ewmaDist = dozenEwmaRef.current;
+    // Entropy modulation: push distribution toward last value when low entropy
+    let entropyDist: [number, number, number] = [1 / 3, 1 / 3, 1 / 3];
+    if (dozenHistory.length) {
+      const last = dozenHistory[dozenHistory.length - 1];
+      const recent = dozenHistory.slice(
+        -Math.max(5, controlsRef.current.entropyWindow)
+      );
+      const rc = [0, 0, 0];
+      recent.forEach((v) => (rc[v] += 1));
+      const denom = recent.length || 1; // avoid 0
+      const rp = rc.map((c) => c / denom);
+      const ent = -rp.reduce((a, c) => (c > 0 ? a + c * Math.log2(c) : a), 0);
+      const maxEnt = Math.log2(3);
+      const decisiveness = 1 - ent / maxEnt; // 0..1
+      const boost = 0.25 * decisiveness;
+      const base = 1 / 3 - boost / 2; // distribute removal across others
+      entropyDist = [0, 1, 2].map((i) =>
+        i === last ? 1 / 3 + boost : base
+      ) as [number, number, number];
+    }
+    // Collect sources
+    const sources: Record<string, [number, number, number]> = {
+      model: modelProbs || dirichlet,
+      markov: markovDist,
+      streak: streakDist,
+      pattern: patternDist,
+      ewma: ewmaDist,
+      bayes: dirichlet,
+      entropyMod: entropyDist,
+    };
+    // Weighting (manual * RL if enabled)
+    const dyn = controlsRef.current.rlEnabled
+      ? rlWeightsRef.current
+      : {
+          model: 1,
+          markov: 1,
+          streak: 1,
+          pattern: 1,
+          ewma: 1,
+          bayes: 1,
+          entropyMod: 1,
+        };
+    const manual = controlsRef.current;
+    const weightMap: Record<string, number> = {
+      model: manual.wModel * dyn.model,
+      markov: manual.wMarkov * dyn.markov,
+      streak: manual.wStreak * dyn.streak,
+      pattern: manual.wPattern * dyn.pattern,
+      ewma: manual.wEwma * dyn.ewma,
+      bayes: manual.wBayes * dyn.bayes,
+      entropyMod: manual.wEntropy * dyn.entropyMod,
+    };
+    const sumW = Object.values(weightMap).reduce((a, b) => a + b, 0) || 1;
+    Object.keys(weightMap).forEach((k) => (weightMap[k] /= sumW));
+    // Blend via weighted log probs
+    const logBlend = [0, 0, 0];
+    Object.entries(sources).forEach(([k, dist]) => {
+      const w = weightMap[k];
+      dist.forEach((p, i) => {
+        const c = Math.max(p, 1e-6);
+        logBlend[i] += w * Math.log(c);
+      });
+    });
+    const expVals = logBlend.map((l) =>
+      Math.exp(Math.max(-50, Math.min(50, l)))
+    );
+    let sumExp = expVals.reduce((a, b) => a + b, 0);
+    if (!isFinite(sumExp) || sumExp <= 0) {
+      sumExp = expVals
+        .filter((v) => isFinite(v) && v > 0)
+        .reduce((a, b) => a + b, 0);
+    }
+    let finalDist = expVals.map((v) => (sumExp > 0 ? v / sumExp : 1 / 3)) as [
+      number,
+      number,
+      number
+    ];
+    // sanitize
+    if (finalDist.some((p) => !isFinite(p) || p < 0)) {
+      finalDist = [1 / 3, 1 / 3, 1 / 3];
+    } else {
+      const sfix = finalDist[0] + finalDist[1] + finalDist[2];
+      if (Math.abs(sfix - 1) > 1e-6) {
+        finalDist = [
+          finalDist[0] / sfix,
+          finalDist[1] / sfix,
+          finalDist[2] / sfix,
+        ];
+      }
+    }
+    // --- Debiasing & confidence shaping ---
+    // 1. Inverse-frequency debias (mild) to prevent early lock-in
+    const totalCounts = counts[0] + counts[1] + counts[2];
+    if (totalCounts > 0) {
+      const gamma = 0.4; // debias strength
+      const invFreqWeights = counts.map((c) =>
+        Math.pow((totalCounts + 3) / (c + 1), gamma)
+      );
+      let wSum = invFreqWeights.reduce((a, b) => a + b, 0);
+      const debiased = [0, 1, 2].map(
+        (i) => (finalDist[i] * invFreqWeights[i]) / wSum
+      ) as [number, number, number];
+      finalDist = debiased;
+    }
+    // 2. Entropy floor (blend with uniform if over-confident too early)
+    const entropy = -finalDist.reduce(
+      (a, p) => (p > 0 ? a + p * Math.log2(p) : a),
+      0
+    );
+    const maxEnt = Math.log2(3);
+    const minAllowed = 0.85 * maxEnt; // encourage diversity
+    if (entropy < minAllowed && dozenHistory.length < 60) {
+      // blend toward uniform proportionally to deficit and data scarcity
+      const deficit = (minAllowed - entropy) / minAllowed; // 0..1
+      const scarcity = 1 - Math.min(dozenHistory.length / 60, 1); // 1 early -> 0 later
+      const blend = Math.min(0.6, deficit * 0.7 * scarcity);
+      finalDist = [0, 1, 2].map(
+        (i) => (1 - blend) * finalDist[i] + blend * (1 / 3)
+      ) as [number, number, number];
+    }
+    // 3. Prediction streak dampening: if same prediction repeats with mediocre realized performance, soften
+    const ps = dozenPredStreakRef.current;
+    const topIdx =
+      finalDist[0] >= finalDist[1] && finalDist[0] >= finalDist[2]
+        ? 0
+        : finalDist[1] >= finalDist[2]
+        ? 1
+        : 2;
+    if (ps.last === topIdx) {
+      ps.len += 1;
+    } else {
+      ps.last = topIdx;
+      ps.len = 1;
+    }
+    if (ps.len >= 4) {
+      // damp top prob a bit and redistribute to others
+      const damp = Math.min(0.15 + (ps.len - 4) * 0.03, 0.35);
+      const removed = finalDist[topIdx] * damp;
+      const remain = finalDist[topIdx] - removed;
+      const addEach = removed / 2;
+      finalDist = [0, 1, 2].map((i) =>
+        i === topIdx ? remain : finalDist[i] + addEach
+      ) as [number, number, number];
+    }
+    // 4. Final renormalize (safety)
+    const fs = finalDist[0] + finalDist[1] + finalDist[2];
+    finalDist = [finalDist[0] / fs, finalDist[1] / fs, finalDist[2] / fs];
+    const pred = topIdx;
+    dozenProbsRef.current = finalDist;
+    dozenPredictionRef.current = { probs: finalDist, predLabel: pred };
+    setDozenVersion((v) => v + 1);
+  }, [dozenHistory, buildDozenFeatureWindow, ensureDozenModel, windowSize]);
+
+  // Effect for dozens mode training/prediction
+  useEffect(() => {
+    if (
+      controlsRef.current.mode === "roulette" &&
+      controlsRef.current.rouletteVariant === "dozens"
+    ) {
+      trainAndPredictDozens();
+    }
+  }, [dozenHistory, trainAndPredictDozens]);
+
+  // Reset dozens-specific state when switching into dozens mode (fresh session to avoid stale blending artifacts)
+  const lastVariantRef = useRef<string | null>(null);
+  useEffect(() => {
+    const curKey = `${controlsRef.current.mode}:${controlsRef.current.rouletteVariant}`;
+    if (curKey !== lastVariantRef.current) {
+      if (
+        controlsRef.current.mode === "roulette" &&
+        controlsRef.current.rouletteVariant === "dozens"
+      ) {
+        // reset dozen tracking (but keep model weights optionally)
+        setDozenHistory([]);
+        setDozenRecords([]);
+        dozenProbsRef.current = null;
+        dozenPredictionRef.current = { probs: null, predLabel: null };
+        setDozenVersion((v) => v + 1);
+        dozenMarkovRef.current = [
+          [1, 1, 1],
+          [1, 1, 1],
+          [1, 1, 1],
+        ];
+        dozenRunPostRef.current = {};
+        dozenEwmaRef.current = null;
+        dozenAccRef.current = { correct: 0, total: 0 };
+      }
+      lastVariantRef.current = curKey;
+    }
+  }, [controlsRef.current.mode, controlsRef.current.rouletteVariant]);
 
   // moved addObservation after dependencies
 
@@ -1032,6 +1479,101 @@ export function useBinaryModel() {
 
   return {
     addObservation,
+    addDozenObservation: (d: 0 | 1 | 2) => {
+      // Snapshot last prediction (prediction should have been for this spin before outcome known)
+      const prevPred = dozenPredictionRef.current;
+      const snapshotLabel =
+        prevPred && typeof prevPred.predLabel === "number"
+          ? (prevPred.predLabel as 0 | 1 | 2)
+          : null;
+      const snapshotProbs: [number, number, number] | null = prevPred?.probs
+        ? ([...prevPred.probs] as [number, number, number])
+        : null;
+      let correct: boolean | null =
+        snapshotLabel != null ? snapshotLabel === d : null;
+      // Defensive: if snapshot label doesn't match but somehow flagged true, fix.
+      if (correct && snapshotLabel !== d) correct = false;
+      if (correct != null) {
+        dozenAccRef.current.total += 1;
+        if (correct) dozenAccRef.current.correct += 1;
+      }
+      setDozenRecords((r) => [
+        ...r,
+        {
+          label: d,
+          predLabel: snapshotLabel,
+          probs:
+            !snapshotProbs || snapshotProbs.some((p) => !isFinite(p))
+              ? [1 / 3, 1 / 3, 1 / 3]
+              : snapshotProbs,
+          correct,
+        },
+      ]);
+      setDozenHistory((h) => {
+        if (h.length) {
+          const last = h[h.length - 1];
+          dozenMarkovRef.current[last][d] += 1;
+          let rl = 1;
+          for (let i = h.length - 2; i >= 0; i--) {
+            if (h[i] === last) rl++;
+            else break;
+          }
+          const key = `${last}:${rl}`;
+          const rec = dozenRunPostRef.current[key] || { cont: 0, rev: 0 };
+          if (d === last) rec.cont += 1;
+          else rec.rev += 1;
+          dozenRunPostRef.current[key] = rec;
+        }
+        return [...h, d];
+      });
+      // RL weight update (multi-class) centered at 1/3 baseline using probability assigned to true label
+      if (prevPred.probs && controlsRef.current.rlEnabled) {
+        const trueP: Record<string, number> = {};
+        const srcList: [string, [number, number, number]][] = [];
+        // reconstruct same source distributions used in blending if available (approximation using current snapshot) - use final dist + uniform fallback
+        // Simpler: use final distribution as proxy for all sources for now to avoid re-computation cost.
+        srcList.push(["model", prevPred.probs]);
+        srcList.push(["markov", prevPred.probs]);
+        srcList.push(["streak", prevPred.probs]);
+        srcList.push(["pattern", prevPred.probs]);
+        srcList.push(["ewma", prevPred.probs]);
+        srcList.push(["bayes", prevPred.probs]);
+        srcList.push(["entropyMod", prevPred.probs]);
+        const eta = controlsRef.current.rlEta;
+        srcList.forEach(([k, dist]) => {
+          trueP[k] = dist[d];
+        });
+        (
+          Object.keys(
+            rlWeightsRef.current
+          ) as (keyof typeof rlWeightsRef.current)[]
+        ).forEach((k) => {
+          const delta = Math.exp(eta * (correct ? 1 : -1) * (trueP[k] - 1 / 3));
+          rlWeightsRef.current[k] = Math.min(
+            4,
+            Math.max(0.25, rlWeightsRef.current[k] * delta)
+          );
+        });
+        const sum =
+          Object.values(rlWeightsRef.current).reduce((a, b) => a + b, 0) || 1;
+        (
+          Object.keys(
+            rlWeightsRef.current
+          ) as (keyof typeof rlWeightsRef.current)[]
+        ).forEach((k) => {
+          rlWeightsRef.current[k] /= sum / 7;
+        });
+      }
+      // Immediately compute next prediction distribution after update (async fire and forget)
+      setTimeout(() => {
+        if (
+          controlsRef.current.mode === "roulette" &&
+          controlsRef.current.rouletteVariant === "dozens"
+        ) {
+          trainAndPredictDozens();
+        }
+      }, 0);
+    },
     history,
     records,
     probOver,
@@ -1043,6 +1585,7 @@ export function useBinaryModel() {
       ? accRef.current.correct / accRef.current.total
       : null,
     controls: controlsRef.current,
+    controlsVersion,
     setControls,
     resetModel,
     rlWeights: rlWeightsRef.current,
@@ -1057,5 +1600,14 @@ export function useBinaryModel() {
       avgRunLenEma: biasRegimeRef.current.avgRunLenEma,
       recentAvgRunLen: biasRegimeRef.current.lastAvgRunLen,
     },
+    // Dozens mode data
+    rouletteDozenHistory: dozenHistory,
+    rouletteDozenProbs: dozenProbsRef.current,
+    rouletteDozenPred: dozenPredictionRef.current.predLabel,
+    rouletteDozenVersion: dozenVersion,
+    rouletteDozenRecords: dozenRecords,
+    rouletteDozenAccuracy: dozenAccRef.current.total
+      ? dozenAccRef.current.correct / dozenAccRef.current.total
+      : null,
   };
 }

@@ -4,8 +4,13 @@ export const BinaryPredictionDisplay: React.FC<{
   loading: boolean;
   backend: string | null;
   count: number;
-}> = ({ probOver, accuracy, loading, backend, count }) => {
-  const rec = probOver == null ? "—" : probOver >= 0.5 ? "OVER >2" : "BELOW ≤2";
+  mode?: "binary" | "roulette";
+}> = ({ probOver, accuracy, loading, backend, count, mode = "binary" }) => {
+  const rec = (() => {
+    if (probOver == null) return "—";
+    if (mode === "roulette") return probOver >= 0.5 ? "RED" : "BLACK";
+    return probOver >= 0.5 ? "OVER" : "UNDER";
+  })();
   return (
     <div className="mt-4 p-4 bg-slate-800/60 border border-slate-700 rounded-lg">
       <div className="flex items-baseline gap-4">
@@ -13,7 +18,11 @@ export const BinaryPredictionDisplay: React.FC<{
           {probOver == null ? "—" : (probOver * 100).toFixed(2) + "%"}
         </div>
         <div className="text-xs text-slate-400 uppercase tracking-wide">
-          {probOver == null ? "No data" : "P(OVER)"}
+          {probOver == null
+            ? "No data"
+            : mode === "roulette"
+            ? "P(RED)"
+            : "P(OVER)"}
         </div>
       </div>
       <div className="mt-2 text-sm font-mono">
