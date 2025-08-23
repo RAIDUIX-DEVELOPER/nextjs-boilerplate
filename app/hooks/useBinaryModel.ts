@@ -66,6 +66,15 @@ export function useBinaryModel() {
   const [dozenRecords, setDozenRecords] = useState<DozenRecord[]>([]);
   // Version bump to force UI re-render when dozens prediction/probs update
   const [dozenVersion, setDozenVersion] = useState(0);
+  // Track last source distributions for dozens to perform accurate RL updates
+  const dozenLastSourcesRef = useRef<Record<
+    string,
+    [number, number, number]
+  > | null>(null);
+  // Per-source performance stats for dozens
+  const dozenSourceStatsRef = useRef<
+    Record<string, { correct: number; total: number }>
+  >({});
   const modelRef = useRef<tf.LayersModel | null>(null);
   const markovCountsRef = useRef([
     [1, 1],
@@ -847,8 +856,8 @@ export function useBinaryModel() {
 
   // Dozens training loop (multi-class)
   const dozenLastTrainRef = useRef(0);
-  const DOZEN_TRAIN_START = 5; // begin adapting after 5 spins
-  const DOZEN_TRAIN_EVERY = 1; // adapt every sample once enough data
+  const DOZEN_TRAIN_START = 8; // give a little more context before first CNN training
+  const DOZEN_TRAIN_EVERY = 2; // train every 2 spins for stability
   // track prediction streak to damp persistent bias
   const dozenPredStreakRef = useRef<{ last: number | null; len: number }>({
     last: null,
@@ -1016,6 +1025,7 @@ export function useBinaryModel() {
       bayes: dirichlet,
       entropyMod: entropyDist,
     };
+    dozenLastSourcesRef.current = sources; // snapshot for RL update
     // Weighting (manual * RL if enabled)
     const dyn = controlsRef.current.rlEnabled
       ? rlWeightsRef.current
@@ -1029,8 +1039,12 @@ export function useBinaryModel() {
           entropyMod: 1,
         };
     const manual = controlsRef.current;
+    // Ramp model weight in gradually to avoid early overfitting dominance
+    const n = dozenHistory.length;
+    const modelRamp =
+      n <= DOZEN_TRAIN_START ? 0 : Math.min(1, (n - DOZEN_TRAIN_START) / 30); // linear ramp over 30 spins
     const weightMap: Record<string, number> = {
-      model: manual.wModel * dyn.model,
+      model: manual.wModel * modelRamp * dyn.model,
       markov: manual.wMarkov * dyn.markov,
       streak: manual.wStreak * dyn.streak,
       pattern: manual.wPattern * dyn.pattern,
@@ -1120,7 +1134,8 @@ export function useBinaryModel() {
       ps.last = topIdx;
       ps.len = 1;
     }
-    if (ps.len >= 4) {
+    if (ps.len >= 5 && n < 120) {
+      // allow more persistence later when enough data
       // damp top prob a bit and redistribute to others
       const damp = Math.min(0.15 + (ps.len - 4) * 0.03, 0.35);
       const removed = finalDist[topIdx] * damp;
@@ -1527,33 +1542,35 @@ export function useBinaryModel() {
         return [...h, d];
       });
       // RL weight update (multi-class) centered at 1/3 baseline using probability assigned to true label
-      if (prevPred.probs && controlsRef.current.rlEnabled) {
-        const trueP: Record<string, number> = {};
-        const srcList: [string, [number, number, number]][] = [];
-        // reconstruct same source distributions used in blending if available (approximation using current snapshot) - use final dist + uniform fallback
-        // Simpler: use final distribution as proxy for all sources for now to avoid re-computation cost.
-        srcList.push(["model", prevPred.probs]);
-        srcList.push(["markov", prevPred.probs]);
-        srcList.push(["streak", prevPred.probs]);
-        srcList.push(["pattern", prevPred.probs]);
-        srcList.push(["ewma", prevPred.probs]);
-        srcList.push(["bayes", prevPred.probs]);
-        srcList.push(["entropyMod", prevPred.probs]);
-        const eta = controlsRef.current.rlEta;
-        srcList.forEach(([k, dist]) => {
-          trueP[k] = dist[d];
+      if (controlsRef.current.rlEnabled && dozenLastSourcesRef.current) {
+        const srcDists = dozenLastSourcesRef.current;
+        const eta = controlsRef.current.rlEta * 0.9; // slightly gentler for multi-class
+        (Object.keys(srcDists) as (keyof typeof srcDists)[]).forEach((k) => {
+          const dist = srcDists[k];
+          const pTrue = dist ? dist[d] : 1 / 3;
+          // Hedge against zero by floor and cap
+          const edge = pTrue - 1 / 3;
+          const reward = correct ? 1 : -1;
+          const mult = Math.exp(eta * reward * edge);
+          rlWeightsRef.current[k as keyof typeof rlWeightsRef.current] =
+            Math.min(
+              5,
+              Math.max(
+                0.2,
+                rlWeightsRef.current[k as keyof typeof rlWeightsRef.current] *
+                  mult
+              )
+            );
+          // stats
+          const stat = dozenSourceStatsRef.current[k as string] || {
+            correct: 0,
+            total: 0,
+          };
+          stat.total += 1;
+          if (correct) stat.correct += 1;
+          dozenSourceStatsRef.current[k as string] = stat;
         });
-        (
-          Object.keys(
-            rlWeightsRef.current
-          ) as (keyof typeof rlWeightsRef.current)[]
-        ).forEach((k) => {
-          const delta = Math.exp(eta * (correct ? 1 : -1) * (trueP[k] - 1 / 3));
-          rlWeightsRef.current[k] = Math.min(
-            4,
-            Math.max(0.25, rlWeightsRef.current[k] * delta)
-          );
-        });
+        // normalize
         const sum =
           Object.values(rlWeightsRef.current).reduce((a, b) => a + b, 0) || 1;
         (

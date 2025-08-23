@@ -93,6 +93,35 @@ function DozensStats({
   const avgStreak = [0, 1, 2].map((i) =>
     streakCounts[i] ? streakSums[i] / streakCounts[i] : 0
   );
+  // Prediction correctness streak metrics (overall & per dozen)
+  let overallCurWin = 0,
+    overallCurLose = 0,
+    overallLongestWin = 0,
+    overallLongestLose = 0;
+  const curWinPer = [0, 0, 0];
+  const curLosePer = [0, 0, 0];
+  const longWinPer = [0, 0, 0];
+  const longLosePer = [0, 0, 0];
+  records.forEach((r) => {
+    if (r.correct == null || typeof r.label !== "number") return;
+    const d = r.label as 0 | 1 | 2;
+    if (r.correct) {
+      overallCurWin += 1;
+      overallCurLose = 0;
+      if (overallCurWin > overallLongestWin) overallLongestWin = overallCurWin;
+      curWinPer[d] += 1;
+      curLosePer[d] = 0;
+      if (curWinPer[d] > longWinPer[d]) longWinPer[d] = curWinPer[d];
+    } else {
+      overallCurLose += 1;
+      overallCurWin = 0;
+      if (overallCurLose > overallLongestLose)
+        overallLongestLose = overallCurLose;
+      curLosePer[d] += 1;
+      curWinPer[d] = 0;
+      if (curLosePer[d] > longLosePer[d]) longLosePer[d] = curLosePer[d];
+    }
+  });
   return (
     <div className="mt-2 flex flex-col gap-2 text-[11px]">
       <div className="grid grid-cols-2 gap-2">
@@ -108,6 +137,20 @@ function DozensStats({
           color="indigo"
           value={accuracy == null ? "—" : (accuracy * 100).toFixed(1) + "%"}
         />
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <MetricCard
+          title="L.Win Stk"
+          color="emerald"
+          value={overallLongestWin}
+        />
+        <MetricCard
+          title="L.Lose Stk"
+          color="rose"
+          value={overallLongestLose}
+        />
+        <MetricCard title="Cur Win Stk" color="emerald" value={overallCurWin} />
+        <MetricCard title="Cur Lose Stk" color="rose" value={overallCurLose} />
       </div>
       <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 lg:grid-cols-7 gap-2">
         {/* Per-class frequency */}
@@ -142,6 +185,22 @@ function DozensStats({
             value={avgStreak[i].toFixed(2)}
           />
         ))}
+        {[0, 1, 2].map((i) => (
+          <MetricCard
+            key={"pw-" + i}
+            title={(i === 0 ? "1st" : i === 1 ? "2nd" : "3rd") + " L.Win"}
+            color={i === 0 ? "cyan" : i === 1 ? "violet" : "fuchsia"}
+            value={longWinPer[i]}
+          />
+        ))}
+        {[0, 1, 2].map((i) => (
+          <MetricCard
+            key={"pl-" + i}
+            title={(i === 0 ? "1st" : i === 1 ? "2nd" : "3rd") + " L.Lose"}
+            color={i === 0 ? "cyan" : i === 1 ? "violet" : "fuchsia"}
+            value={longLosePer[i]}
+          />
+        ))}
         <div className="col-span-full rounded border border-fuchsia-600/40 bg-fuchsia-700/10 px-3 py-2 flex flex-col items-start">
           <span className="text-[9px] uppercase tracking-wide text-fuchsia-300">
             Note
@@ -174,6 +233,7 @@ function MetricCard({
     cyan: "border-cyan-600/40 bg-cyan-700/10 text-cyan-200",
     violet: "border-violet-600/40 bg-violet-700/10 text-violet-200",
     fuchsia: "border-fuchsia-600/40 bg-fuchsia-700/10 text-fuchsia-200",
+    rose: "border-rose-600/40 bg-rose-700/10 text-rose-200",
   } as const;
   return (
     <div
