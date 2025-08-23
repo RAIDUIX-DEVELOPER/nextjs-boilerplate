@@ -16,9 +16,12 @@ interface ProbParts {
 
 export function useBinaryModel() {
   const windowSize = 24;
-  const featureCount = 8;
-  const epochs = 2;
+  // Expanded feature set: original 8 + avg OVER run length + avg BELOW run length (normalized)
+  const featureCount = 10;
+  const epochs = 1; // reduced for perf
   const batchSize = 32;
+  const TRAIN_START = 10; // lowered (was 50) to begin CNN training earlier
+  const TRAIN_EVERY = 3; // train every 3rd eligible sample
   const [history, setHistory] = useState<number[]>([]);
   interface OutcomeRecord {
     label: 0 | 1;
@@ -89,6 +92,10 @@ export function useBinaryModel() {
     countLose: number; // number of completed losing streaks
     sumActualRuns: number; // total length of completed actual outcome runs
     countActualRuns: number; // number of completed actual outcome runs
+    sumOverRuns: number; // total length of completed OVER (1) runs
+    countOverRuns: number; // number of completed OVER runs
+    sumBelowRuns: number; // total length of completed BELOW (0) runs
+    countBelowRuns: number; // number of completed BELOW runs
   }
   const [metrics, setMetrics] = useState<Metrics>({
     longestWin: 0,
@@ -103,6 +110,10 @@ export function useBinaryModel() {
     countLose: 0,
     sumActualRuns: 0,
     countActualRuns: 0,
+    sumOverRuns: 0,
+    countOverRuns: 0,
+    sumBelowRuns: 0,
+    countBelowRuns: 0,
   });
 
   // === Bias / Regime Detection Config ===
@@ -151,25 +162,9 @@ export function useBinaryModel() {
   };
 
   const buildModel = () => {
+    // Leaner model to reduce per-fit latency & overfitting risk on tiny online batches
     const m = tf.sequential();
     m.add(tf.layers.inputLayer({ inputShape: [windowSize, featureCount] }));
-    m.add(
-      tf.layers.conv1d({
-        filters: 32,
-        kernelSize: 3,
-        activation: "relu",
-        padding: "same",
-      })
-    );
-    m.add(
-      tf.layers.conv1d({
-        filters: 32,
-        kernelSize: 5,
-        activation: "relu",
-        padding: "same",
-      })
-    );
-    m.add(tf.layers.dropout({ rate: 0.1 }));
     m.add(
       tf.layers.conv1d({
         filters: 24,
@@ -178,27 +173,76 @@ export function useBinaryModel() {
         padding: "same",
       })
     );
+    m.add(
+      tf.layers.conv1d({
+        filters: 16,
+        kernelSize: 5,
+        activation: "relu",
+        padding: "same",
+      })
+    );
+    m.add(tf.layers.dropout({ rate: 0.15 }));
     m.add(tf.layers.globalAveragePooling1d());
-    m.add(tf.layers.dense({ units: 32, activation: "relu" }));
+    m.add(
+      tf.layers.dense({
+        units: 24,
+        activation: "relu",
+        kernelRegularizer: tf.regularizers.l2({ l2: 1e-4 }),
+      })
+    );
     m.add(tf.layers.dense({ units: 1, activation: "sigmoid" }));
     m.compile({ optimizer: tf.train.adam(0.001), loss: "binaryCrossentropy" });
     return m;
   };
   const ensureModel = useCallback(async () => {
-    if (modelRef.current) return modelRef.current;
-    modelRef.current = buildModel();
+    if (modelRef.current) {
+      // Guard against hot-reload mismatch when featureCount changes
+      const curShape = modelRef.current.inputs?.[0]?.shape;
+      if (curShape && curShape[2] !== featureCount) {
+        modelRef.current.dispose();
+        modelRef.current = null;
+      }
+    }
+    if (!modelRef.current) modelRef.current = buildModel();
     return modelRef.current;
-  }, []);
+  }, [featureCount]);
 
   // Stable memoized feature builder (prevents effect dependency churn -> retrain loop)
   const buildFeatureWindow = useCallback((seq: number[]): number[][] => {
     const feats: number[][] = [];
+    if (!seq.length) return feats;
     let streak = 0;
     let lastVal = seq[0];
     let timeSinceOver = 0;
     let timeSinceUnder = 0;
+    // Running sums/counts of COMPLETED runs (separate for over/below)
+    let sumOverRuns = 0;
+    let countOverRuns = 0;
+    let sumBelowRuns = 0;
+    let countBelowRuns = 0;
+    // Track previous index value to detect run boundaries for completed runs BEFORE current index i
+    let runVal = seq[0];
+    let runLen = 1;
+    const recordCompletedRun = (val: number, len: number) => {
+      if (val === 1) {
+        sumOverRuns += len;
+        countOverRuns += 1;
+      } else {
+        sumBelowRuns += len;
+        countBelowRuns += 1;
+      }
+    };
     for (let i = 0; i < seq.length; i++) {
       const v = seq[i];
+      if (i > 0) {
+        if (v === runVal) runLen += 1;
+        else {
+          // previous run completed at i-1, record it (excluding current ongoing run from averages at this point)
+          recordCompletedRun(runVal, runLen);
+          runVal = v;
+          runLen = 1;
+        }
+      }
       if (v === lastVal) streak += 1;
       else {
         streak = 1;
@@ -214,15 +258,27 @@ export function useBinaryModel() {
       const slice = (n: number) => seq.slice(Math.max(0, i - (n - 1)), i + 1);
       const roll = (arr: number[]) =>
         arr.reduce((a, b) => a + b, 0) / arr.length;
+      const avgOver = countOverRuns
+        ? sumOverRuns / countOverRuns
+        : runVal === 1
+        ? runLen
+        : 0;
+      const avgBelow = countBelowRuns
+        ? sumBelowRuns / countBelowRuns
+        : runVal === 0
+        ? runLen
+        : 0;
       feats.push([
-        v,
-        Math.min(streak / 20, 1),
-        i > 0 && seq[i - 1] !== v ? 1 : 0,
+        v, // current value
+        Math.min(streak / 20, 1), // normalized current streak length
+        i > 0 && seq[i - 1] !== v ? 1 : 0, // transition flag
         roll(slice(5)),
         roll(slice(10)),
         roll(slice(20)),
         Math.min(timeSinceOver / 20, 1),
         Math.min(timeSinceUnder / 20, 1),
+        Math.min(avgOver / 20, 1), // NEW avg OVER run length normalized
+        Math.min(avgBelow / 20, 1), // NEW avg BELOW run length normalized
       ]);
     }
     return feats;
@@ -316,7 +372,21 @@ export function useBinaryModel() {
   };
 
   const recomputePendingRef = useRef(false);
+  const lastFrameRef = useRef<number | null>(null);
   const recomputeCurrentProb = useCallback(async () => {
+    // Throttle to one recompute per animation frame
+    const nowFrame = typeof window !== "undefined" ? performance.now() : 0;
+    if (lastFrameRef.current && nowFrame - lastFrameRef.current < 12) {
+      if (!recomputePendingRef.current) {
+        recomputePendingRef.current = true;
+        requestAnimationFrame(() => {
+          recomputePendingRef.current = false;
+          recomputeCurrentProb();
+        });
+      }
+      return;
+    }
+    lastFrameRef.current = nowFrame;
     if (recomputePendingRef.current) return; // simple debounce
     recomputePendingRef.current = true;
     if (history.length < 5) {
@@ -444,13 +514,16 @@ export function useBinaryModel() {
       return;
     }
     const m = await ensureModel();
-    const lastWinRaw = history.slice(-windowSize);
-    const feats = buildFeatureWindow(lastWinRaw);
-    const lastTensor = tf.tensor3d([feats]);
-    const modelProbT = m.predict(lastTensor) as tf.Tensor;
-    const modelProb = (await modelProbT.data())[0];
-    lastTensor.dispose();
-    modelProbT.dispose();
+    const { modelProb } = tf.tidy(() => {
+      const lastWinRaw = history.slice(-windowSize);
+      const feats = buildFeatureWindow(lastWinRaw);
+      const lastTensor = tf.tensor3d([feats]);
+      const modelProbT = m.predict(lastTensor) as tf.Tensor;
+      const data = modelProbT.dataSync(); // sync small tensor read
+      lastTensor.dispose();
+      modelProbT.dispose();
+      return { modelProb: data[0] };
+    });
     const last = history[history.length - 1];
     const mc = markovCountsRef.current;
     const row = mc[last];
@@ -600,6 +673,11 @@ export function useBinaryModel() {
       await recomputeCurrentProb();
       return;
     }
+    // Gate early training to allow heuristics stabilization
+    if (history.length < TRAIN_START || history.length % TRAIN_EVERY !== 0) {
+      await recomputeCurrentProb();
+      return;
+    }
     // Throttle: only retrain if we have at least 1 new sample since last train
     if (history.length === lastTrainCountRef.current) {
       // Only need to recompute blend (e.g. weights changed externally)
@@ -618,16 +696,30 @@ export function useBinaryModel() {
       setProbOver(null);
       return;
     }
+    const t0 = performance.now();
     const xs = tf.tensor3d(xsArr);
     const ys = tf.tensor2d(ysArr.map((v) => [v]));
     await m.fit(xs, ys, {
       epochs,
-      batchSize: Math.min(batchSize, xsArr.length),
+      batchSize: Math.min(16, xsArr.length),
       shuffle: true,
       verbose: 0,
     });
     xs.dispose();
     ys.dispose();
+    if (process.env.NODE_ENV !== "production") {
+      const t1 = performance.now();
+      const mem = tf.memory();
+      // eslint-disable-next-line no-console
+      console.debug(
+        "[train] samples",
+        history.length,
+        "fit(ms)",
+        (t1 - t0).toFixed(1),
+        "tensors",
+        mem.numTensors
+      );
+    }
     lastTrainCountRef.current = history.length;
     await recomputeCurrentProb();
   }, [
@@ -703,10 +795,16 @@ export function useBinaryModel() {
             countLose,
             sumActualRuns,
             countActualRuns,
+            sumOverRuns: m.sumOverRuns,
+            countOverRuns: m.countOverRuns,
+            sumBelowRuns: m.sumBelowRuns,
+            countBelowRuns: m.countBelowRuns,
           };
         });
       }
+      const rlAllowed = history.length >= windowSize * 2; // freeze RL until sufficient samples
       if (
+        rlAllowed &&
         controlsRef.current.rlEnabled &&
         probPartsRef.current &&
         predLabel === 1
@@ -743,7 +841,11 @@ export function useBinaryModel() {
         ).forEach((k) => {
           rlWeightsRef.current[k] /= sum / 7; // 7 sources
         });
-      } else if (controlsRef.current.rlEnabled && predLabel === 0) {
+      } else if (
+        rlAllowed &&
+        controlsRef.current.rlEnabled &&
+        predLabel === 0
+      ) {
         (
           Object.keys(
             rlWeightsRef.current
@@ -800,6 +902,14 @@ export function useBinaryModel() {
               ...m,
               sumActualRuns: m.sumActualRuns + runLen,
               countActualRuns: m.countActualRuns + 1,
+              sumOverRuns:
+                prevVal === 1 ? m.sumOverRuns + runLen : m.sumOverRuns,
+              countOverRuns:
+                prevVal === 1 ? m.countOverRuns + 1 : m.countOverRuns,
+              sumBelowRuns:
+                prevVal === 0 ? m.sumBelowRuns + runLen : m.sumBelowRuns,
+              countBelowRuns:
+                prevVal === 0 ? m.countBelowRuns + 1 : m.countBelowRuns,
             }));
           }
         }

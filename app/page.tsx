@@ -21,6 +21,10 @@ function StatsBar({
     countLose: number;
     sumActualRuns: number;
     countActualRuns: number;
+    sumOverRuns: number;
+    countOverRuns: number;
+    sumBelowRuns: number;
+    countBelowRuns: number;
   };
 }) {
   const decided = records.filter((r) => r.correct != null);
@@ -38,6 +42,12 @@ function StatsBar({
     : metrics.longestLose || 0;
   const avgActualRun = metrics.countActualRuns
     ? metrics.sumActualRuns / metrics.countActualRuns
+    : 0;
+  const avgOverRun = metrics.countOverRuns
+    ? metrics.sumOverRuns / metrics.countOverRuns
+    : 0;
+  const avgBelowRun = metrics.countBelowRuns
+    ? metrics.sumBelowRuns / metrics.countBelowRuns
     : 0;
   return (
     <div className="mt-2 grid grid-cols-3 gap-2 text-[11px]">
@@ -65,7 +75,7 @@ function StatsBar({
           {winPct.toFixed(1)}%
         </span>
       </div>
-      <div className="rounded border border-teal-600/40 bg-teal-700/10 px-3 py-2 flex flex-col items-start col-span-3">
+      <div className="rounded border border-teal-600/40 bg-teal-700/10 px-3 py-2 flex flex-col items-start">
         <span className="text-[9px] uppercase tracking-wide text-teal-300">
           Over Prediction Hit %
         </span>
@@ -120,6 +130,22 @@ function StatsBar({
         </span>
         <span className="text-purple-200 font-semibold tabular-nums">
           {avgActualRun.toFixed(2)}
+        </span>
+      </div>
+      <div className="rounded border border-emerald-600/40 bg-emerald-700/10 px-3 py-2 flex flex-col items-start">
+        <span className="text-[9px] uppercase tracking-wide text-emerald-300">
+          Avg OVER Run
+        </span>
+        <span className="text-emerald-200 font-semibold tabular-nums">
+          {avgOverRun.toFixed(2)}
+        </span>
+      </div>
+      <div className="rounded border border-cyan-600/40 bg-cyan-700/10 px-3 py-2 flex flex-col items-start">
+        <span className="text-[9px] uppercase tracking-wide text-cyan-300">
+          Avg BELOW Run
+        </span>
+        <span className="text-cyan-200 font-semibold tabular-nums">
+          {avgBelowRun.toFixed(2)}
         </span>
       </div>
     </div>
@@ -220,6 +246,8 @@ export default function Home() {
               onBelow={() => addObservation(0)}
               onOver={() => addObservation(1)}
               disabled={loading}
+              probOver={probOver}
+              threshold={controls.threshold}
             />
           </div>
           <BinaryPredictionDisplay
@@ -228,9 +256,6 @@ export default function Home() {
             loading={loading}
             backend={backend}
             count={history.length}
-            threshold={controls.threshold}
-            suggestedThreshold={suggestedThreshold}
-            biasInfo={biasInfo}
           />
           <StatsBar records={records} metrics={metrics} />
           {diagnostics && (
