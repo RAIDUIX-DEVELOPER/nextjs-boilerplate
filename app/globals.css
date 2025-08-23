@@ -3,19 +3,19 @@
 :root {
   --background: #ffffff;
   --foreground: #171717;
-}
-
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --accent-teal: #14b8a6;
+  --accent-cyan: #06b6d4;
+  --accent-sky: #0ea5e9;
+  --panel: #0f172a;
+  --panel-border: #1e293b;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
     --background: #0a0a0a;
     --foreground: #ededed;
+    --panel: #0f172a;
+    --panel-border: #1f2937;
   }
 }
 
@@ -23,4 +23,15 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+}
+
+.glass-panel {
+  background: linear-gradient(
+    145deg,
+    rgba(30, 41, 59, 0.6),
+    rgba(15, 23, 42, 0.4)
+  );
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
 }
