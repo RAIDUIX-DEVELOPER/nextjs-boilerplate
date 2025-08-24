@@ -941,6 +941,21 @@ export function useBinaryModel() {
     triggers: 0,
     lastActive: false,
   });
+  // Regret & calibration tracking
+  const dozenRegretRef = useRef<[number, number, number]>([0, 0, 0]);
+  const dozenHiConfWrongRef = useRef<number[]>([]); // 1 = high confidence wrong
+  const dozenRecentWindowRef = useRef<number[]>([]); // recent actual outcomes
+  // Regret / calibration constants
+  const DZ_LOWCONF_GAP = 0.05;
+  const DZ_LOWCONF_TOP = 0.45;
+  const DZ_REGRET_DECAY = 0.92;
+  const DZ_REGRET_LIMIT = 2.2;
+  const DZ_REGRET_HARD = 3.5;
+  const DZ_HICONF_PROB = 0.5;
+  const DZ_HICONF_CLAMP = 0.56;
+  const DZ_HICONF_WINDOW = 40;
+  const DZ_HICONF_ERRRATE = 0.62;
+  const DZ_MAJ_WINDOW = 12;
 
   // === DOZENS DECISION HELPERS ===
   const sampleDirichlet = (
@@ -1753,6 +1768,104 @@ export function useBinaryModel() {
       dozenGuardRef.current.triggers += 1;
     }
     dozenGuardRef.current.lastActive = guardActive;
+    // --- Regret suppression & calibration adjustments BEFORE chooseDozen ---
+    (function applyRegretAndCalibration() {
+      // 1. Regret-based suppression
+      const reg = dozenRegretRef.current;
+      const maxReg = Math.max(reg[0], reg[1], reg[2]);
+      if (maxReg > DZ_REGRET_LIMIT) {
+        const scaled = [0, 1, 2].map((i) => {
+          const r = reg[i];
+          if (r <= DZ_REGRET_LIMIT) return finalDist[i];
+          const over = Math.min(r, DZ_REGRET_HARD) - DZ_REGRET_LIMIT;
+          const factor = Math.max(0.35, Math.exp(-0.7 * over));
+          return finalDist[i] * factor;
+        }) as [number, number, number];
+        const s = scaled[0] + scaled[1] + scaled[2];
+        if (s > 0) finalDist = [scaled[0] / s, scaled[1] / s, scaled[2] / s];
+      }
+      // 2. High-confidence miscalibration clamp
+      if (dozenHiConfWrongRef.current.length >= 12) {
+        const errRate =
+          dozenHiConfWrongRef.current.reduce((a, b) => a + b, 0) /
+          dozenHiConfWrongRef.current.length;
+        if (errRate > DZ_HICONF_ERRRATE) {
+          const topIdx =
+            finalDist[0] >= finalDist[1] && finalDist[0] >= finalDist[2]
+              ? 0
+              : finalDist[1] >= finalDist[2]
+              ? 1
+              : 2;
+          if (finalDist[topIdx] > DZ_HICONF_CLAMP) {
+            const cap = DZ_HICONF_CLAMP;
+            const excess = finalDist[topIdx] - cap;
+            const others = [0, 1, 2].filter((i) => i !== topIdx);
+            finalDist[topIdx] = cap;
+            finalDist[others[0]] += excess / 2;
+            finalDist[others[1]] += excess / 2;
+          }
+        }
+      }
+      // 3. Majority fallback for low confidence
+      const sortedLC = [...finalDist].sort((a, b) => b - a);
+      const topLC = sortedLC[0],
+        secondLC = sortedLC[1];
+      if (
+        topLC - secondLC < DZ_LOWCONF_GAP &&
+        topLC < DZ_LOWCONF_TOP &&
+        dozenRecentWindowRef.current.length >= 6
+      ) {
+        const freq: [number, number, number] = [0, 0, 0];
+        dozenRecentWindowRef.current.forEach((c) => (freq[c] += 1));
+        const majIdx =
+          freq[0] >= freq[1] && freq[0] >= freq[2]
+            ? 0
+            : freq[1] >= freq[2]
+            ? 1
+            : 2;
+        const currentTopIdx =
+          finalDist[0] >= finalDist[1] && finalDist[0] >= finalDist[2]
+            ? 0
+            : finalDist[1] >= finalDist[2]
+            ? 1
+            : 2;
+        if (majIdx !== currentTopIdx) {
+          const blend = 0.3;
+          finalDist = [0, 1, 2].map(
+            (i) =>
+              (1 - blend) * finalDist[i] + blend * (i === majIdx ? 0.6 : 0.2)
+          ) as [number, number, number];
+          const s2 = finalDist[0] + finalDist[1] + finalDist[2];
+          finalDist = [finalDist[0] / s2, finalDist[1] / s2, finalDist[2] / s2];
+        }
+      }
+      // 4. Earlier per-class miss streak cap enforcement
+      const miss = dozenPerClassMissRef.current;
+      const MISS_CAP_START = 2;
+      for (let i = 0; i < 3; i++) {
+        if (miss[i] >= MISS_CAP_START) {
+          const topIdx =
+            finalDist[0] >= finalDist[1] && finalDist[0] >= finalDist[2]
+              ? 0
+              : finalDist[1] >= finalDist[2]
+              ? 1
+              : 2;
+          if (i === topIdx && finalDist[i] < 0.55) {
+            const reduce = finalDist[i] * 0.25;
+            finalDist[i] -= reduce;
+            const others = [0, 1, 2].filter((c) => c !== i);
+            finalDist[others[0]] += reduce / 2;
+            finalDist[others[1]] += reduce / 2;
+            const s3 = finalDist[0] + finalDist[1] + finalDist[2];
+            finalDist = [
+              finalDist[0] / s3,
+              finalDist[1] / s3,
+              finalDist[2] / s3,
+            ];
+          }
+        }
+      }
+    })();
     const decide = chooseDozen(
       finalDist,
       counts as [number, number, number],
@@ -2197,6 +2310,25 @@ export function useBinaryModel() {
             correct: !!correct,
             prob: pChosen,
           });
+          // Regret tracking & high-confidence wrong accumulation
+          if (snapshotLabel != null) {
+            if (correct) {
+              dozenRegretRef.current[snapshotLabel] *= DZ_REGRET_DECAY;
+            } else {
+              dozenRegretRef.current[snapshotLabel] =
+                dozenRegretRef.current[snapshotLabel] * DZ_REGRET_DECAY +
+                (1 - pChosen);
+            }
+            if (pChosen >= DZ_HICONF_PROB) {
+              dozenHiConfWrongRef.current.push(correct ? 0 : 1);
+              if (dozenHiConfWrongRef.current.length > DZ_HICONF_WINDOW) {
+                dozenHiConfWrongRef.current.splice(
+                  0,
+                  dozenHiConfWrongRef.current.length - DZ_HICONF_WINDOW
+                );
+              }
+            }
+          }
           if (dozenRecentResultsRef.current.length > 250) {
             dozenRecentResultsRef.current.splice(
               0,
@@ -2235,6 +2367,14 @@ export function useBinaryModel() {
         }
         return [...h, d];
       });
+      // Maintain recent actual outcomes window for majority fallback
+      dozenRecentWindowRef.current.push(d);
+      if (dozenRecentWindowRef.current.length > DZ_MAJ_WINDOW) {
+        dozenRecentWindowRef.current.splice(
+          0,
+          dozenRecentWindowRef.current.length - DZ_MAJ_WINDOW
+        );
+      }
       // RL weight update (multi-class) centered at 1/3 baseline using probability assigned to true label
       if (controlsRef.current.rlEnabled && dozenLastSourcesRef.current) {
         const srcDists = dozenLastSourcesRef.current;
