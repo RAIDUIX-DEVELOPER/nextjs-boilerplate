@@ -1,7 +1,7 @@
 "use client";
 // HistoryList replaced by inline chips for binary outcomes
+import React, { useState, useMemo } from "react";
 import { BinaryButtons } from "./components/BinaryButtons";
-import { BinaryPredictionDisplay } from "./components/BinaryPredictionDisplay";
 import { ControlPanel } from "./components/ControlPanel";
 import { useBinaryModel } from "./hooks/useBinaryModel";
 
@@ -53,37 +53,60 @@ function DozensStats({
     label?: number;
     predLabel?: number | null;
     correct: boolean | null;
+    probs?: number[] | null;
   }[];
   accuracy: number | null;
-  samples: number;
+  samples: number; // total samples overall
   history: (0 | 1 | 2)[];
 }) {
-  const decided = records.filter((r) => r.correct != null);
-  const wins = decided.filter((r) => r.correct).length;
-  const winPct = decided.length ? (wins / decided.length) * 100 : 0;
-  // Per-dozen counts & per-dozen accuracy
-  const counts: number[] = [0, 0, 0];
-  history.forEach((d) => (counts[d] += 1));
+  const [windowSize, setWindowSize] = useState<number | "ALL">("ALL");
+  const windowRecords = useMemo(
+    () => (windowSize === "ALL" ? records : records.slice(-windowSize)),
+    [records, windowSize]
+  );
+  const windowHistory = useMemo(
+    () => (windowSize === "ALL" ? history : history.slice(-windowSize)),
+    [history, windowSize]
+  );
+  // Per-dozen occurrence counts (based on actual history subset)
+  const counts = [0, 0, 0];
+  windowHistory.forEach((d) => (counts[d] += 1));
+  // Per-class accuracy (occurrence accuracy: how often we were correct when that dozen appeared)
   const perClassCorrect = [0, 0, 0];
   const perClassTotal = [0, 0, 0];
-  records.forEach((r) => {
-    if (typeof r.label === "number") {
+  windowRecords.forEach((r) => {
+    if (typeof r.label === "number" && r.correct != null) {
       perClassTotal[r.label] += 1;
       if (r.correct) perClassCorrect[r.label] += 1;
     }
   });
-  // Average streak lengths per dozen
+  // Prediction-based win% (success rate conditioned on predicting that dozen)
+  const predPerClassCorrect = [0, 0, 0];
+  const predPerClassTotal = [0, 0, 0];
+  windowRecords.forEach((r) => {
+    if (typeof r.predLabel === "number" && r.correct != null) {
+      predPerClassTotal[r.predLabel] += 1;
+      if (r.correct) predPerClassCorrect[r.predLabel] += 1;
+    }
+  });
+  // Window accuracy (overall)
+  const windowDecided = windowRecords.filter((r) => r.correct != null);
+  const windowWins = windowDecided.filter((r) => r.correct).length;
+  const windowWinPct = windowDecided.length
+    ? (windowWins / windowDecided.length) * 100
+    : 0;
+  // Streak/run length stats for windowHistory
   const streakSums = [0, 0, 0];
   const streakCounts = [0, 0, 0];
-  if (history.length) {
-    let cur = history[0];
+  if (windowHistory.length) {
+    let cur = windowHistory[0];
     let len = 1;
-    for (let i = 1; i < history.length; i++) {
-      if (history[i] === cur) len++;
+    for (let i = 1; i < windowHistory.length; i++) {
+      if (windowHistory[i] === cur) len++;
       else {
         streakSums[cur] += len;
         streakCounts[cur] += 1;
-        cur = history[i];
+        cur = windowHistory[i];
         len = 1;
       }
     }
@@ -93,19 +116,27 @@ function DozensStats({
   const avgStreak = [0, 1, 2].map((i) =>
     streakCounts[i] ? streakSums[i] / streakCounts[i] : 0
   );
-  // Prediction correctness streak metrics (overall & per dozen)
-  let overallCurWin = 0,
-    overallCurLose = 0,
-    overallLongestWin = 0,
-    overallLongestLose = 0;
+  // Prediction correctness streak metrics (per dozen) within windowRecords
   const curWinPer = [0, 0, 0];
   const curLosePer = [0, 0, 0];
   const longWinPer = [0, 0, 0];
   const longLosePer = [0, 0, 0];
-  records.forEach((r) => {
-    if (r.correct == null || typeof r.label !== "number") return;
+  let overallCurWin = 0,
+    overallCurLose = 0,
+    overallLongestWin = 0,
+    overallLongestLose = 0;
+  let sumWinRuns = 0,
+    countWinRuns = 0,
+    sumLoseRuns = 0,
+    countLoseRuns = 0;
+  let runType: "win" | "lose" | null = null;
+  let runLen = 0;
+  for (let i = 0; i < windowRecords.length; i++) {
+    const r = windowRecords[i];
+    if (r.correct == null || typeof r.label !== "number") continue;
     const d = r.label as 0 | 1 | 2;
-    if (r.correct) {
+    const isWin = r.correct === true;
+    if (isWin) {
       overallCurWin += 1;
       overallCurLose = 0;
       if (overallCurWin > overallLongestWin) overallLongestWin = overallCurWin;
@@ -121,95 +152,218 @@ function DozensStats({
       curWinPer[d] = 0;
       if (curLosePer[d] > longLosePer[d]) longLosePer[d] = curLosePer[d];
     }
-  });
+    const currentType = isWin ? "win" : "lose";
+    if (runType == null) {
+      runType = currentType;
+      runLen = 1;
+    } else if (runType === currentType) {
+      runLen += 1;
+    } else {
+      if (runType === "win") {
+        sumWinRuns += runLen;
+        countWinRuns += 1;
+      } else {
+        sumLoseRuns += runLen;
+        countLoseRuns += 1;
+      }
+      runType = currentType;
+      runLen = 1;
+    }
+  }
+  if (runType === "win" && runLen) {
+    sumWinRuns += runLen;
+    countWinRuns += 1;
+  } else if (runType === "lose" && runLen) {
+    sumLoseRuns += runLen;
+    countLoseRuns += 1;
+  }
+  const avgWinRun = countWinRuns ? sumWinRuns / countWinRuns : 0;
+  const avgLoseRun = countLoseRuns ? sumLoseRuns / countLoseRuns : 0;
+  const freqPct = (i: number) =>
+    windowHistory.length
+      ? ((counts[i] / windowHistory.length) * 100).toFixed(1) + "%"
+      : "—";
+  const occAccPct = (i: number) =>
+    perClassTotal[i]
+      ? ((perClassCorrect[i] / perClassTotal[i]) * 100).toFixed(1) + "%"
+      : "—";
+  const winPctPerPred = (i: number) =>
+    predPerClassTotal[i]
+      ? ((predPerClassCorrect[i] / predPerClassTotal[i]) * 100).toFixed(1) + "%"
+      : "—";
   return (
-    <div className="mt-2 flex flex-col gap-2 text-[11px]">
-      <div className="grid grid-cols-2 gap-2">
-        <MetricCard title="Samples" color="sky" value={samples} />
-        <MetricCard title="Decisions" color="emerald" value={decided.length} />
-        <MetricCard
-          title="Win %"
-          color="teal"
-          value={winPct.toFixed(1) + "%"}
-        />
-        <MetricCard
-          title="Accuracy"
-          color="indigo"
-          value={accuracy == null ? "—" : (accuracy * 100).toFixed(1) + "%"}
-        />
-      </div>
-      <div className="grid grid-cols-2 gap-2">
-        <MetricCard
-          title="L.Win Stk"
-          color="emerald"
-          value={overallLongestWin}
-        />
-        <MetricCard
-          title="L.Lose Stk"
-          color="rose"
-          value={overallLongestLose}
-        />
-        <MetricCard title="Cur Win Stk" color="emerald" value={overallCurWin} />
-        <MetricCard title="Cur Lose Stk" color="rose" value={overallCurLose} />
-      </div>
-      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 lg:grid-cols-7 gap-2">
-        {/* Per-class frequency */}
-        {[0, 1, 2].map((i) => (
-          <MetricCard
-            key={"freq-" + i}
-            title={(i === 0 ? "1st" : i === 1 ? "2nd" : "3rd") + " Freq"}
-            color={i === 0 ? "cyan" : i === 1 ? "violet" : "fuchsia"}
-            value={
-              samples ? ((counts[i] / samples) * 100).toFixed(1) + "%" : "—"
-            }
-          />
-        ))}
-        {[0, 1, 2].map((i) => (
-          <MetricCard
-            key={"acc-" + i}
-            title={(i === 0 ? "1st" : i === 1 ? "2nd" : "3rd") + " Acc"}
-            color={i === 0 ? "cyan" : i === 1 ? "violet" : "fuchsia"}
-            value={
-              perClassTotal[i]
-                ? ((perClassCorrect[i] / perClassTotal[i]) * 100).toFixed(1) +
-                  "%"
-                : "—"
-            }
-          />
-        ))}
-        {[0, 1, 2].map((i) => (
-          <MetricCard
-            key={"streak-" + i}
-            title={(i === 0 ? "1st" : i === 1 ? "2nd" : "3rd") + " Avg Run"}
-            color={i === 0 ? "cyan" : i === 1 ? "violet" : "fuchsia"}
-            value={avgStreak[i].toFixed(2)}
-          />
-        ))}
-        {[0, 1, 2].map((i) => (
-          <MetricCard
-            key={"pw-" + i}
-            title={(i === 0 ? "1st" : i === 1 ? "2nd" : "3rd") + " L.Win"}
-            color={i === 0 ? "cyan" : i === 1 ? "violet" : "fuchsia"}
-            value={longWinPer[i]}
-          />
-        ))}
-        {[0, 1, 2].map((i) => (
-          <MetricCard
-            key={"pl-" + i}
-            title={(i === 0 ? "1st" : i === 1 ? "2nd" : "3rd") + " L.Lose"}
-            color={i === 0 ? "cyan" : i === 1 ? "violet" : "fuchsia"}
-            value={longLosePer[i]}
-          />
-        ))}
-        <div className="col-span-full rounded border border-fuchsia-600/40 bg-fuchsia-700/10 px-3 py-2 flex flex-col items-start">
-          <span className="text-[9px] uppercase tracking-wide text-fuchsia-300">
-            Note
-          </span>
-          <span className="text-fuchsia-200 text-[10px] leading-snug">
-            Per-dozen frequency, accuracy, and average run lengths help spot
-            emerging biases or streak structures.
-          </span>
+    <div className="mt-3 text-[11px] space-y-3">
+      <div className="space-y-2">
+        <div className="flex justify-between items-center">
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] uppercase tracking-wide text-slate-500 pl-1 border-l border-slate-700/60">
+              Window
+            </span>
+            <div className="flex gap-1">
+              {[25, 50, 100, 500, "ALL"].map((w) => (
+                <button
+                  key={w}
+                  onClick={() => setWindowSize(w as any)}
+                  className={`h-7 px-3 rounded-md text-[11px] font-medium transition-colors border ${
+                    windowSize === w
+                      ? "border-teal-500/70 bg-teal-600/20 text-teal-300 shadow-[0_0_0_1px_rgba(45,212,191,0.3)]"
+                      : "border-slate-700 bg-slate-800/60 text-slate-300 hover:border-teal-500/60 hover:text-teal-200"
+                  }`}
+                >
+                  {w}
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
+        <div className="flex flex-wrap gap-2 items-stretch">
+          {[
+            { label: "Total", value: samples, title: "Total samples overall" },
+            {
+              label: "Window",
+              value: windowHistory.length,
+              title: "Samples inside selected window",
+            },
+            {
+              label: "Dec",
+              value: windowDecided.length,
+              title: "Predictions made (decided spins) in window",
+            },
+            {
+              label: "Win%",
+              value: windowWinPct.toFixed(1) + "%",
+              title: "Win% (correct / decided) in window",
+            },
+            {
+              label: "Acc",
+              value: windowDecided.length
+                ? ((windowWins / windowDecided.length) * 100).toFixed(1) + "%"
+                : "—",
+              title: "Overall accuracy in window",
+            },
+          ].map((box) => (
+            <div
+              key={box.label}
+              title={box.title}
+              className="h-8 px-3 rounded-md bg-slate-800/70 border border-slate-700 flex items-center gap-2"
+            >
+              <span className="text-[10px] uppercase tracking-wide text-slate-400">
+                {box.label}
+              </span>
+              <span className="tabular-nums text-slate-200 text-[11px]">
+                {box.value}
+              </span>
+            </div>
+          ))}
+          <div
+            title="Average consecutive correct prediction run"
+            className="h-8 px-3 rounded-md bg-gradient-to-r from-emerald-900/40 to-emerald-800/20 border border-emerald-700/60 text-emerald-300 flex items-center gap-2"
+          >
+            <span className="text-[10px] uppercase tracking-wide">Avg W</span>
+            <span className="tabular-nums text-[11px]">
+              {avgWinRun.toFixed(2)}
+            </span>
+          </div>
+          <div
+            title="Average consecutive incorrect prediction run"
+            className="h-8 px-3 rounded-md bg-gradient-to-r from-rose-900/40 to-rose-800/20 border border-rose-700/60 text-rose-300 flex items-center gap-2"
+          >
+            <span className="text-[10px] uppercase tracking-wide">Avg L</span>
+            <span className="tabular-nums text-[11px]">
+              {avgLoseRun.toFixed(2)}
+            </span>
+          </div>
+        </div>
+      </div>
+      <table className="w-full text-[11px] border-separate border-spacing-y-1">
+        <thead>
+          <tr className="text-slate-400">
+            <th className="text-left px-2 py-1">Dozen</th>
+            <th className="text-right px-2 py-1">Freq</th>
+            <th className="text-right px-2 py-1">Occ Acc</th>
+            <th className="text-right px-2 py-1">Win%</th>
+            <th className="text-right px-2 py-1">Avg Run</th>
+            <th className="text-right px-2 py-1">L.Win</th>
+            <th className="text-right px-2 py-1">L.Lose</th>
+            <th className="text-right px-2 py-1">Cur Win</th>
+            <th className="text-right px-2 py-1">Cur Lose</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr className="bg-slate-900/70">
+            <td className="px-2 py-1 font-semibold text-slate-200">Overall</td>
+            <td className="px-2 py-1 text-right text-slate-300">100%</td>
+            <td className="px-2 py-1 text-right text-slate-300">
+              {windowDecided.length
+                ? ((windowWins / windowDecided.length) * 100).toFixed(1) + "%"
+                : "—"}
+            </td>
+            <td className="px-2 py-1 text-right text-teal-300">
+              {windowDecided.length ? windowWinPct.toFixed(1) + "%" : "—"}
+            </td>
+            <td className="px-2 py-1 text-right text-slate-300">
+              {(avgStreak.reduce((a, b) => a + b, 0) / 3).toFixed(2)}
+            </td>
+            <td className="px-2 py-1 text-right text-emerald-300">
+              {Math.max(...longWinPer)}
+            </td>
+            <td className="px-2 py-1 text-right text-rose-300">
+              {Math.max(...longLosePer)}
+            </td>
+            <td className="px-2 py-1 text-right text-emerald-400/80">
+              {overallCurWin}
+            </td>
+            <td className="px-2 py-1 text-right text-rose-400/80">
+              {overallCurLose}
+            </td>
+          </tr>
+          {[0, 1, 2].map((i) => {
+            const curWin = curWinPer[i];
+            const curLose = curLosePer[i];
+            return (
+              <tr
+                key={i}
+                className="bg-slate-900/50 hover:bg-slate-800/50 transition-colors"
+              >
+                <td className="px-2 py-1 font-medium text-slate-300">
+                  {i === 0 ? "1st 12" : i === 1 ? "2nd 12" : "3rd 12"}
+                </td>
+                <td className="px-2 py-1 text-right text-slate-300">
+                  {freqPct(i)}
+                </td>
+                <td className="px-2 py-1 text-right text-slate-300">
+                  {occAccPct(i)}
+                </td>
+                <td className="px-2 py-1 text-right text-teal-300">
+                  {winPctPerPred(i)}
+                </td>
+                <td className="px-2 py-1 text-right text-slate-300">
+                  {avgStreak[i].toFixed(2)}
+                </td>
+                <td className="px-2 py-1 text-right text-emerald-300">
+                  {longWinPer[i]}
+                </td>
+                <td className="px-2 py-1 text-right text-rose-300">
+                  {longLosePer[i]}
+                </td>
+                <td className="px-2 py-1 text-right text-emerald-400/80">
+                  {curWin}
+                </td>
+                <td className="px-2 py-1 text-right text-rose-400/80">
+                  {curLose}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <div className="flex gap-3 flex-wrap text-[10px] text-slate-500">
+        <span>Occ Acc = accuracy on spins where that dozen occurred.</span>
+        <span>Win% = accuracy when predicting that dozen.</span>
+        <span>Window buttons slice recent samples.</span>
+        <span>
+          Avg W/L Run = mean consecutive correct / incorrect prediction streaks.
+        </span>
       </div>
     </div>
   );
@@ -489,8 +643,8 @@ export default function Home() {
     return norm;
   })();
   return (
-    <div className="min-h-screen w-full bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 text-slate-200 px-5 py-10">
-      <div className="max-w-xl mx-auto">
+    <div className="min-h-screen w-full bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 text-slate-200 px-6 py-10">
+      <div className="max-w-2xl mx-auto">
         <header className="mb-10">
           <h1 className="text-2xl font-semibold tracking-tight bg-gradient-to-r from-teal-300 via-cyan-300 to-sky-400 text-transparent bg-clip-text">
             Realtime Forecast
@@ -502,12 +656,7 @@ export default function Home() {
           {/* Game Mode Selector */}
           <div className="mt-4 flex flex-wrap gap-2 text-[11px]">
             {[
-              {
-                key: "binary",
-                label: "Binary (Over/Under)",
-                mode: "binary",
-                variant: "redblack",
-              },
+              // Re-ordered so Roulette Dozens appears first / default
               {
                 key: "rb",
                 label: "Roulette Red/Black",
@@ -519,6 +668,12 @@ export default function Home() {
                 label: "Roulette Dozens",
                 mode: "roulette",
                 variant: "dozens",
+              },
+              {
+                key: "binary",
+                label: "Binary (Over/Under)",
+                mode: "binary",
+                variant: "redblack",
               },
             ].map((item) => {
               const active =
@@ -563,51 +718,11 @@ export default function Home() {
               disabled={loading}
               probOver={probOver}
               threshold={controls.threshold}
+              dozenProbs={rouletteDozenProbs || undefined}
+              dozenPred={rouletteDozenPred ?? null}
             />
           </div>
-          {controls.mode === "roulette" &&
-          controls.rouletteVariant === "dozens" ? (
-            <div
-              key={"dozens-panel-" + rouletteDozenVersion}
-              className="mt-4 p-4 bg-slate-800/60 border border-slate-700 rounded-lg text-[11px] flex flex-col gap-2"
-            >
-              <div className="flex items-baseline gap-6">
-                <h3 className="text-xs tracking-wide text-slate-300 font-semibold">
-                  Dozens Prediction
-                </h3>
-                {rouletteDozenPred != null && (
-                  <span className="text-[10px] text-teal-300">
-                    Pred:{" "}
-                    {rouletteDozenPred === 0
-                      ? "1st"
-                      : rouletteDozenPred === 1
-                      ? "2nd"
-                      : "3rd"}{" "}
-                    12
-                  </span>
-                )}
-                {rouletteDozenAccuracy != null && (
-                  <span className="text-[10px] text-sky-300">
-                    Acc {(rouletteDozenAccuracy * 100).toFixed(1)}%
-                  </span>
-                )}
-              </div>
-              <DozensPanel
-                probs={rouletteDozenProbs || [1 / 3, 1 / 3, 1 / 3]}
-                samples={rouletteDozenHistory?.length || 0}
-                pred={rouletteDozenPred ?? null}
-              />
-            </div>
-          ) : (
-            <BinaryPredictionDisplay
-              probOver={probOver}
-              accuracy={accuracy}
-              loading={loading}
-              backend={backend}
-              count={history.length}
-              mode={controls.mode}
-            />
-          )}
+          {/* Removed legacy large Dozens Prediction panel (superseded by compact buttons + stats) */}
           {!(
             controls.mode === "roulette" &&
             controls.rouletteVariant === "dozens"

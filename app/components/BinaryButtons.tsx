@@ -14,6 +14,8 @@ export const BinaryButtons: React.FC<{
   threshold?: number;
   mode?: "binary" | "roulette";
   rouletteVariant?: "redblack" | "dozens";
+  dozenProbs?: [number, number, number];
+  dozenPred?: number | null;
 }> = ({
   onBelow,
   onOver,
@@ -27,6 +29,8 @@ export const BinaryButtons: React.FC<{
   threshold = 0.5,
   mode = "binary",
   rouletteVariant = "redblack",
+  dozenProbs,
+  dozenPred,
 }) => {
   const isOver = probOver != null && probOver >= threshold;
   const label =
@@ -102,7 +106,36 @@ export const BinaryButtons: React.FC<{
             3rd 12
           </button>
         </div>
-        {/* Prediction badge not shown for dozens (multi-class) using binary prob currently */}
+        <div className="min-w-[170px] px-3 py-2 rounded border border-slate-600 bg-slate-800/60 text-[10px] flex flex-col gap-1">
+          <span className="uppercase tracking-wide font-semibold text-slate-300">
+            Prediction
+          </span>
+          {dozenProbs ? (
+            <div className="grid grid-cols-3 gap-1">
+              {dozenProbs.map((p, i) => {
+                const active = dozenPred === i;
+                const label = i === 0 ? "1st" : i === 1 ? "2nd" : "3rd";
+                return (
+                  <div
+                    key={i}
+                    className={`p-1 rounded text-center border transition-colors ${
+                      active
+                        ? "bg-teal-600/20 border-teal-500/50 text-teal-300"
+                        : "bg-slate-700/40 border-slate-600 text-slate-300"
+                    }`}
+                  >
+                    {(p * 100).toFixed(1)}%
+                    <div className="text-[8px] opacity-70 leading-tight">
+                      {label}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <span className="text-slate-500">—</span>
+          )}
+        </div>
       </div>
     );
   }

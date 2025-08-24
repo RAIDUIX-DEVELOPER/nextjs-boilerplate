@@ -37,6 +37,56 @@ export function useBinaryModel() {
   const [probOver, setProbOver] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [backend, setBackend] = useState<string | null>(null);
+  // Backend readiness control to prevent model building before backend initialized
+  const backendReadyRef = useRef(false);
+  const backendInitPromiseRef = useRef<Promise<void> | null>(null);
+  const ensureBackend = useCallback(async () => {
+    if (backendReadyRef.current && backend) return;
+    if (backendInitPromiseRef.current) {
+      await backendInitPromiseRef.current;
+      return;
+    }
+    backendInitPromiseRef.current = (async () => {
+      await tf.ready();
+      let selected = tf.getBackend();
+      if (!selected || selected === "cpu") {
+        try {
+          const hasNavigatorGPU =
+            typeof navigator !== "undefined" && (navigator as any).gpu;
+          if (
+            hasNavigatorGPU &&
+            (tf as any).engine()?.registryFactory?.["webgpu"]
+          ) {
+            try {
+              const adapter = await (navigator as any).gpu.requestAdapter?.();
+              if (
+                adapter &&
+                typeof (adapter as any).requestAdapterInfo === "function"
+              ) {
+                await tf.setBackend("webgpu");
+                selected = tf.getBackend();
+              } else {
+                await tf.setBackend("webgl");
+                selected = tf.getBackend();
+              }
+            } catch {
+              await tf.setBackend("webgl");
+              selected = tf.getBackend();
+            }
+          } else {
+            await tf.setBackend("webgl");
+            selected = tf.getBackend();
+          }
+        } catch {
+          // fallback remains whatever tf chose
+          selected = tf.getBackend();
+        }
+      }
+      setBackend(selected);
+      backendReadyRef.current = true;
+    })();
+    await backendInitPromiseRef.current;
+  }, [backend]);
   // Roulette dozens mode state (separate simple frequency tracker)
   const [dozenHistory, setDozenHistory] = useState<(0 | 1 | 2)[]>([]);
   const dozenProbsRef = useRef<[number, number, number] | null>(null);
@@ -233,6 +283,7 @@ export function useBinaryModel() {
     return m;
   };
   const ensureModel = useCallback(async () => {
+    await ensureBackend();
     if (modelRef.current) {
       // Guard against hot-reload mismatch when featureCount changes
       const curShape = modelRef.current.inputs?.[0]?.shape;
@@ -243,7 +294,7 @@ export function useBinaryModel() {
     }
     if (!modelRef.current) modelRef.current = buildModel();
     return modelRef.current;
-  }, [featureCount]);
+  }, [featureCount, ensureBackend]);
 
   // === Dozens (multi-class) model helpers ===
   const dozenFeatureCount = 11; // one-hot(3) + runLen + transition + freq(3) + timeSince(3)
@@ -293,9 +344,10 @@ export function useBinaryModel() {
     return m;
   };
   const ensureDozenModel = useCallback(async () => {
+    await ensureBackend();
     if (!dozenModelRef.current) dozenModelRef.current = buildDozenModel();
     return dozenModelRef.current;
-  }, []);
+  }, [ensureBackend]);
 
   const buildDozenFeatureWindow = useCallback(
     (seq: (0 | 1 | 2)[]): number[][] => {
@@ -434,8 +486,8 @@ export function useBinaryModel() {
     bayesPriorA: 1,
     bayesPriorB: 1,
     entropyWindow: 20,
-    mode: "binary" as "binary" | "roulette", // UI mode toggle
-    rouletteVariant: "redblack" as "redblack" | "dozens",
+    mode: "roulette" as "binary" | "roulette", // default start mode switched to roulette
+    rouletteVariant: "dozens" as "redblack" | "dozens", // default variant set to dozens
   });
   const [controlsVersion, setControlsVersion] = useState(0);
 
@@ -645,6 +697,11 @@ export function useBinaryModel() {
         threshold: controlsRef.current.threshold,
       };
       setProbOver(effective);
+      recomputePendingRef.current = false;
+      return;
+    }
+    if (!backendReadyRef.current) await ensureBackend();
+    if (!backendReadyRef.current) {
       recomputePendingRef.current = false;
       return;
     }
@@ -1098,6 +1155,8 @@ export function useBinaryModel() {
   };
   // === END DOZENS DECISION HELPERS ===
   const trainAndPredictDozens = useCallback(async () => {
+    if (!backendReadyRef.current) await ensureBackend();
+    if (!backendReadyRef.current) return; // still not ready
     const m = await ensureDozenModel();
     // If insufficient history for a window, still output a uniform distribution so UI has stable values.
     if (dozenHistory.length === 0) {
@@ -1422,6 +1481,98 @@ export function useBinaryModel() {
           finalDist[1] / sfix,
           finalDist[2] / sfix,
         ];
+      }
+    }
+    // --- Early-phase diversification (prevent pure persistence before learning) ---
+    if (n < 25) {
+      const total = counts[0] + counts[1] + counts[2];
+      let freqDist: [number, number, number] = total
+        ? [counts[0] / total, counts[1] / total, counts[2] / total]
+        : [1 / 3, 1 / 3, 1 / 3];
+      // Light Laplace smoothing toward uniform
+      const SMOOTH_A = 0.8;
+      freqDist = [
+        (counts[0] + SMOOTH_A) / (total + 3 * SMOOTH_A),
+        (counts[1] + SMOOTH_A) / (total + 3 * SMOOTH_A),
+        (counts[2] + SMOOTH_A) / (total + 3 * SMOOTH_A),
+      ];
+      const uniform: [number, number, number] = [1 / 3, 1 / 3, 1 / 3];
+      // Dynamic diversity strength stronger very early, fades to 0 by 25
+      const diversityMix = 0.35 * (1 - n / 25);
+      if (diversityMix > 0) {
+        const blendedBase = [0, 1, 2].map(
+          (i) => 0.5 * freqDist[i] + 0.5 * uniform[i]
+        ) as [number, number, number];
+        finalDist = [0, 1, 2].map(
+          (i) =>
+            (1 - diversityMix) * finalDist[i] + diversityMix * blendedBase[i]
+        ) as [number, number, number];
+        const sE = finalDist[0] + finalDist[1] + finalDist[2];
+        if (sE > 0) {
+          finalDist = [finalDist[0] / sE, finalDist[1] / sE, finalDist[2] / sE];
+        }
+        // If still near-persistent (top equals last actual with tiny gap) inject a mild Thompson sample blend
+        if (dozenHistory.length) {
+          const lastVal = dozenHistory[dozenHistory.length - 1];
+          const sortedGap = [...finalDist].sort((a, b) => b - a);
+          const gap = sortedGap[0] - sortedGap[1];
+          if (gap < 0.12 && finalDist[lastVal] === Math.max(...finalDist)) {
+            const alphaDir: [number, number, number] = [
+              counts[0] + 0.8,
+              counts[1] + 0.8,
+              counts[2] + 0.8,
+            ];
+            // simple Dirichlet sample (reuse helper if desired, inline light version)
+            const gamma = (a: number): number => {
+              const aa = Math.max(1e-3, a);
+              if (aa < 1) {
+                const u = Math.random();
+                return gamma(aa + 1) * Math.pow(u, 1 / aa);
+              }
+              const d = aa - 1 / 3;
+              const c = 1 / Math.sqrt(9 * d);
+              while (true) {
+                let x: number, v: number;
+                do {
+                  const u = Math.random();
+                  const u2 = Math.random();
+                  const nrm =
+                    Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * u2);
+                  x = nrm;
+                  v = 1 + c * x;
+                } while (v <= 0);
+                v = v * v * v;
+                const u3 = Math.random();
+                if (
+                  u3 < 1 - 0.0331 * (x * x) * (x * x) ||
+                  Math.log(u3) < 0.5 * x * x + d * (1 - v + Math.log(v))
+                ) {
+                  return d * v;
+                }
+              }
+            };
+            const g0 = gamma(alphaDir[0]);
+            const g1 = gamma(alphaDir[1]);
+            const g2 = gamma(alphaDir[2]);
+            const gs = g0 + g1 + g2;
+            const dirSample: [number, number, number] = [
+              g0 / gs,
+              g1 / gs,
+              g2 / gs,
+            ];
+            const exploreBlend = 0.5 * diversityMix; // modest injection
+            finalDist = [0, 1, 2].map(
+              (i) =>
+                (1 - exploreBlend) * finalDist[i] + exploreBlend * dirSample[i]
+            ) as [number, number, number];
+            const sEx = finalDist[0] + finalDist[1] + finalDist[2];
+            finalDist = [
+              finalDist[0] / sEx,
+              finalDist[1] / sEx,
+              finalDist[2] / sEx,
+            ];
+          }
+        }
       }
     }
     // Prediction imbalance mitigation: avoid over-predicting one dozen compared to its actual frequency.
@@ -2208,47 +2359,14 @@ export function useBinaryModel() {
 
   useEffect(() => {
     (async () => {
-      await tf.ready();
-      if (!backend) {
-        const hasNavigatorGPU =
-          typeof navigator !== "undefined" && (navigator as any).gpu;
-        let selected = "webgl"; // default fallback
-        if (
-          hasNavigatorGPU &&
-          (tf as any).engine()?.registryFactory?.["webgpu"]
-        ) {
-          try {
-            // Additional feature probe: request adapter & ensure requestAdapterInfo exists
-            const adapter = await (navigator as any).gpu.requestAdapter?.();
-            if (
-              adapter &&
-              typeof (adapter as any).requestAdapterInfo === "function"
-            ) {
-              await tf.setBackend("webgpu");
-              selected = tf.getBackend();
-            } else {
-              // Skip attempting webgpu backend if required method missing
-              await tf.setBackend("webgl");
-              selected = tf.getBackend();
-            }
-          } catch (err) {
-            // Silent fallback; avoid spamming console with internal backend errors
-            await tf.setBackend("webgl");
-            selected = tf.getBackend();
-          }
-        } else {
-          await tf.setBackend("webgl");
-          selected = tf.getBackend();
-        }
-        setBackend(selected);
-      }
+      await ensureBackend();
       if (history.length) {
         setLoading(true);
         await trainAndPredict();
         setLoading(false);
       }
     })();
-  }, [history, trainAndPredict, backend]);
+  }, [history, trainAndPredict, ensureBackend]);
 
   return {
     addObservation,
