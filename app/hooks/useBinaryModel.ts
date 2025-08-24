@@ -918,6 +918,139 @@ export function useBinaryModel() {
     total: 0,
   });
   const dozenRecentPredsRef = useRef<{ label: number; correct: boolean }[]>([]);
+  // Extended decision dynamics
+  const dozenPerClassMissRef = useRef<[number, number, number]>([0, 0, 0]);
+  const dozenRecentResultsRef = useRef<{ correct: boolean; prob: number }[]>(
+    []
+  );
+
+  // === DOZENS DECISION HELPERS ===
+  const sampleDirichlet = (
+    v: [number, number, number]
+  ): [number, number, number] => {
+    // Simplified gamma sampling (shape alpha, scale 1)
+    const gamma = (alpha: number): number => {
+      const a = Math.max(1e-3, alpha);
+      if (a < 1) {
+        // Johnk / Ahrens-Dieter style
+        const u = Math.random();
+        return gamma(a + 1) * Math.pow(u, 1 / a);
+      }
+      const d = a - 1 / 3;
+      const c = 1 / Math.sqrt(9 * d);
+      while (true) {
+        let x: number;
+        let v2: number;
+        do {
+          const u = Math.random();
+          const u2 = Math.random();
+          const n = Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * u2);
+          x = n;
+          v2 = 1 + c * x;
+        } while (v2 <= 0);
+        v2 = v2 * v2 * v2;
+        const u3 = Math.random();
+        if (
+          u3 < 1 - 0.0331 * (x * x) * (x * x) ||
+          Math.log(u3) < 0.5 * x * x + d * (1 - v2 + Math.log(v2))
+        ) {
+          return d * v2;
+        }
+      }
+    };
+    const g = v.map(gamma) as [number, number, number];
+    const s = g[0] + g[1] + g[2];
+    return [g[0] / s, g[1] / s, g[2] / s];
+  };
+
+  interface DecisionInfo {
+    method: string;
+    gap: number;
+    top: number;
+  }
+  const chooseDozen = (
+    baseDist: [number, number, number],
+    counts: [number, number, number]
+  ): {
+    dist: [number, number, number];
+    pred: 0 | 1 | 2;
+    info: DecisionInfo;
+  } => {
+    let dist: [number, number, number] = [...baseDist] as any;
+    // Dynamic temperature based on recent realized accuracy
+    const rec = dozenRecentResultsRef.current.slice(-25);
+    if (rec.length >= 12) {
+      const acc = rec.filter((r) => r.correct).length / rec.length;
+      let T = 1.0;
+      if (acc < 0.3) T = 1.15; // flatten (explore more)
+      else if (acc > 0.4) T = 0.88; // sharpen (exploit)
+      if (T !== 1) {
+        const adj = dist.map((p) => Math.pow(Math.max(p, 1e-8), 1 / T));
+        const sT = adj.reduce((a, b) => a + b, 0);
+        if (sT > 0) dist = [adj[0] / sT, adj[1] / sT, adj[2] / sT] as any;
+      }
+    }
+    // Miss streak capping (if repeatedly wrong on class with low prob advantage)
+    const secondProb = [...dist].sort((a, b) => b - a)[1];
+    for (let i = 0; i < 3; i++) {
+      if (dozenPerClassMissRef.current[i] >= 2 && dist[i] < 0.5) {
+        const cap = Math.min(dist[i], secondProb + 0.04);
+        if (cap < dist[i]) {
+          const diff = dist[i] - cap;
+          dist[i] = cap;
+          const others = [0, 1, 2].filter((c) => c !== i);
+          const add = diff / 2;
+          dist[others[0]] += add;
+          dist[others[1]] += diff - add;
+        }
+      }
+    }
+    // Low-confidence diversification
+    const sorted = [...dist].sort((a, b) => b - a);
+    const top = sorted[0];
+    const gap = top - sorted[1];
+    let method = "argmax";
+    if (gap < 0.06 || top < 0.43) {
+      // Thompson sampling
+      const alpha: [number, number, number] = [
+        counts[0] + 0.6,
+        counts[1] + 0.6,
+        counts[2] + 0.6,
+      ];
+      const dir = sampleDirichlet(alpha);
+      const BLEND = 0.55;
+      dist = [
+        (1 - BLEND) * dist[0] + BLEND * dir[0],
+        (1 - BLEND) * dist[1] + BLEND * dir[1],
+        (1 - BLEND) * dist[2] + BLEND * dir[2],
+      ];
+      const sDir = dist[0] + dist[1] + dist[2];
+      dist = [dist[0] / sDir, dist[1] / sDir, dist[2] / sDir] as any;
+      method = "thompson";
+      // Epsilon small exploration if still near uniform
+      const dev =
+        Math.abs(dist[0] - 1 / 3) +
+        Math.abs(dist[1] - 1 / 3) +
+        Math.abs(dist[2] - 1 / 3);
+      if (dev < 0.12 && Math.random() < 0.07) {
+        let r = Math.random();
+        for (let i = 0; i < 3; i++) {
+          if (r < dist[i]) {
+            return {
+              dist,
+              pred: i as 0 | 1 | 2,
+              info: { method: "epsilon", gap, top },
+            };
+          }
+          r -= dist[i];
+        }
+      }
+    }
+    const pred =
+      dist[0] >= dist[1] && dist[0] >= dist[2] ? 0 : dist[1] >= dist[2] ? 1 : 2;
+    return { dist, pred: pred as 0 | 1 | 2, info: { method, gap, top } };
+  };
+  // === END DOZENS DECISION HELPERS ===
   const trainAndPredictDozens = useCallback(async () => {
     const m = await ensureDozenModel();
     // If insufficient history for a window, still output a uniform distribution so UI has stable values.
@@ -1245,6 +1378,37 @@ export function useBinaryModel() {
         if (sf > 0) {
           finalDist = [finalDist[0] / sf, finalDist[1] / sf, finalDist[2] / sf];
         }
+        // Due-frequency (undersampled) gentle encouragement: if a class is significantly below uniform (by gap), add a small additive mass proportional to gap and time since last occurrence.
+        const timeSince = [0, 0, 0];
+        // compute time since last occurrence for each dozen
+        for (let i = dozenHistory.length - 1; i >= 0; i--) {
+          const v = dozenHistory[i];
+          if (timeSince[v] === 0) timeSince[v] = dozenHistory.length - i - 1;
+          if (timeSince.every((t) => t > 0)) break;
+        }
+        const DUE_GAP_MIN = 0.1; // minimum gap below uniform to consider due
+        const DUE_BASE_ADD = 0.04; // base additive probability mass
+        const DUE_TIME_SCALE = 0.015; // incremental per spin absent
+        let added = 0;
+        for (let i = 0; i < 3; i++) {
+          const gap = 1 / 3 - fshare[i];
+          if (gap > DUE_GAP_MIN) {
+            const add =
+              DUE_BASE_ADD +
+              Math.min(0.12, gap * 0.5) +
+              Math.min(0.08, timeSince[i] * DUE_TIME_SCALE);
+            finalDist[i] += add;
+            added += add;
+          }
+        }
+        if (added > 0) {
+          const sDue = finalDist[0] + finalDist[1] + finalDist[2];
+          finalDist = [
+            finalDist[0] / sDue,
+            finalDist[1] / sDue,
+            finalDist[2] / sDue,
+          ];
+        }
       }
     }
     // 2. Alternation detection (simple ABAB or ABC rotation) to encourage switching when pattern strength high.
@@ -1427,58 +1591,45 @@ export function useBinaryModel() {
         finalDist = adj.map((v) => v / sAdj) as [number, number, number];
       }
     }
-    // Recompute argmax AFTER dampening & temperature sharpening. If it changed, reset streak counter to avoid mismatch.
-    const newTopIdx =
-      finalDist[0] >= finalDist[1] && finalDist[0] >= finalDist[2]
-        ? 0
-        : finalDist[1] >= finalDist[2]
-        ? 1
-        : 2;
-    // Hard cap: never allow more than 3 consecutive losses on same predicted dozen.
-    // If error streak for that dozen >=3 (already recorded before this spin) AND it would still predict same dozen, force pick best alternative.
+    // Decision (confidence-aware & stochastic when low confidence)
+    const decide = chooseDozen(finalDist, counts as [number, number, number]);
+    finalDist = decide.dist;
+    const pred = decide.pred;
+    // Early anti-tunnel: if last two incorrect on same dozen with low prob, force alternate best
     if (
-      dozenPredErrorStreakRef.current.last === newTopIdx &&
-      dozenPredErrorStreakRef.current.incorrect >= 3
+      dozenPredErrorStreakRef.current.last === pred &&
+      dozenPredErrorStreakRef.current.incorrect >= 2 &&
+      Math.max(...finalDist) < 0.5
     ) {
-      // choose alternative with highest probability among others
-      const altCandidates: { idx: number; p: number }[] = [0, 1, 2]
-        .filter((i) => i !== newTopIdx)
-        .map((i) => ({ idx: i, p: finalDist[i] }));
-      altCandidates.sort((a, b) => b.p - a.p);
-      if (altCandidates.length) {
-        const forced = altCandidates[0].idx;
-        // Transfer a portion of probability mass to reinforce forced switch
-        const SWITCH_PORTION = 0.15;
-        const transfer = Math.min(
-          SWITCH_PORTION,
-          finalDist[newTopIdx] * 0.5 // cap by probability share
-        );
-        finalDist[newTopIdx] -= transfer;
-        finalDist[forced] += transfer;
-        const sForce = finalDist[0] + finalDist[1] + finalDist[2];
+      const alts = [0, 1, 2]
+        .filter((i) => i !== pred)
+        .map((i) => ({ i, p: finalDist[i] }))
+        .sort((a, b) => b.p - a.p);
+      if (alts.length) {
+        const forced = alts[0].i;
+        // small transfer
+        const tr = Math.min(0.12, finalDist[pred] * 0.4);
+        finalDist[pred] -= tr;
+        finalDist[forced] += tr;
+        const sf2 = finalDist[0] + finalDist[1] + finalDist[2];
         finalDist = [
-          finalDist[0] / sForce,
-          finalDist[1] / sForce,
-          finalDist[2] / sForce,
+          finalDist[0] / sf2,
+          finalDist[1] / sf2,
+          finalDist[2] / sf2,
         ];
-        // treat as new top idx candidate
-        if (forced !== newTopIdx) {
-          ps.last = forced; // reset streak to avoid immediate damp
-          ps.len = 1;
-        }
+        ps.last = forced;
+        ps.len = 1;
+        dozenPredictionRef.current = {
+          probs: finalDist,
+          predLabel: forced as 0 | 1 | 2,
+        };
+      } else {
+        dozenPredictionRef.current = { probs: finalDist, predLabel: pred };
       }
+    } else {
+      dozenPredictionRef.current = { probs: finalDist, predLabel: pred };
     }
-    if (newTopIdx !== topIdx) {
-      // Prediction flipped due to dampening/sharpening; reset streak tracking so new label isn't unfairly damped immediately.
-      ps.last = newTopIdx;
-      ps.len = 1;
-    }
-    // 4. Final renormalize (safety)
-    const fs = finalDist[0] + finalDist[1] + finalDist[2];
-    finalDist = [finalDist[0] / fs, finalDist[1] / fs, finalDist[2] / fs];
-    const pred = newTopIdx;
     dozenProbsRef.current = finalDist;
-    dozenPredictionRef.current = { probs: finalDist, predLabel: pred };
     setDozenVersion((v) => v + 1);
   }, [dozenHistory, buildDozenFeatureWindow, ensureDozenModel, windowSize]);
 
@@ -1870,6 +2021,24 @@ export function useBinaryModel() {
         rec.total += 1;
         if (correct) rec.correct += 1;
       }
+      // Update miss streak & recent results for decision temperature
+      if (snapshotLabel != null) {
+        if (correct) dozenPerClassMissRef.current[snapshotLabel] = 0;
+        else dozenPerClassMissRef.current[snapshotLabel] += 1;
+        if (snapshotProbs) {
+          const pChosen = snapshotProbs[snapshotLabel];
+          dozenRecentResultsRef.current.push({
+            correct: !!correct,
+            prob: pChosen,
+          });
+          if (dozenRecentResultsRef.current.length > 250) {
+            dozenRecentResultsRef.current.splice(
+              0,
+              dozenRecentResultsRef.current.length - 250
+            );
+          }
+        }
+      }
       // Track recent prediction list for dynamic gating window
       if (snapshotLabel != null && correct != null) {
         dozenRecentPredsRef.current.push({
@@ -1903,7 +2072,15 @@ export function useBinaryModel() {
       // RL weight update (multi-class) centered at 1/3 baseline using probability assigned to true label
       if (controlsRef.current.rlEnabled && dozenLastSourcesRef.current) {
         const srcDists = dozenLastSourcesRef.current;
-        const eta = controlsRef.current.rlEta * 1.05; // slightly more aggressive multi-class RL
+        // Confidence-aware eta modulation
+        let eta = controlsRef.current.rlEta * 1.05;
+        if (snapshotLabel != null && snapshotProbs) {
+          const pChosen = snapshotProbs[snapshotLabel];
+          if (!correct && pChosen < 0.45) eta *= 1.6; // stronger penalty
+          else if (correct && pChosen > 0.5)
+            eta *= 1.25; // reward only strong corrects
+          else eta *= 0.6; // damp neutral outcomes
+        }
         (Object.keys(srcDists) as (keyof typeof srcDists)[]).forEach((k) => {
           const dist = srcDists[k];
           const pTrue = dist ? dist[d] : 1 / 3;
