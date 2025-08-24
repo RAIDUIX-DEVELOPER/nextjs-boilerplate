@@ -923,6 +923,24 @@ export function useBinaryModel() {
   const dozenRecentResultsRef = useRef<{ correct: boolean; prob: number }[]>(
     []
   );
+  // Regime tracking (streak vs choppy vs mixed)
+  const dozenRegimeRef = useRef<{
+    regime: "STREAK" | "CHOPPY" | "MIXED";
+    avgRun: number;
+    changeRate: number;
+    runVar: number;
+  }>({ regime: "MIXED", avgRun: 0, changeRate: 0, runVar: 0 });
+  // Last decision details for diagnostics
+  const dozenDecisionInfoRef = useRef<{
+    method: string;
+    gap: number;
+    top: number;
+  } | null>(null);
+  // Early accuracy guard diagnostics
+  const dozenGuardRef = useRef<{ triggers: number; lastActive: boolean }>({
+    triggers: 0,
+    lastActive: false,
+  });
 
   // === DOZENS DECISION HELPERS ===
   const sampleDirichlet = (
@@ -970,7 +988,8 @@ export function useBinaryModel() {
   }
   const chooseDozen = (
     baseDist: [number, number, number],
-    counts: [number, number, number]
+    counts: [number, number, number],
+    regime: "STREAK" | "CHOPPY" | "MIXED"
   ): {
     dist: [number, number, number];
     pred: 0 | 1 | 2;
@@ -992,8 +1011,12 @@ export function useBinaryModel() {
     }
     // Miss streak capping (if repeatedly wrong on class with low prob advantage)
     const secondProb = [...dist].sort((a, b) => b - a)[1];
+    const missCapThreshold = regime === "CHOPPY" ? 1 : 2; // tighter in choppy regime
     for (let i = 0; i < 3; i++) {
-      if (dozenPerClassMissRef.current[i] >= 2 && dist[i] < 0.5) {
+      if (
+        dozenPerClassMissRef.current[i] >= missCapThreshold &&
+        dist[i] < 0.5
+      ) {
         const cap = Math.min(dist[i], secondProb + 0.04);
         if (cap < dist[i]) {
           const diff = dist[i] - cap;
@@ -1010,7 +1033,12 @@ export function useBinaryModel() {
     const top = sorted[0];
     const gap = top - sorted[1];
     let method = "argmax";
-    if (gap < 0.06 || top < 0.43) {
+    // Regime-aware thresholds
+    const gapThresh =
+      regime === "STREAK" ? 0.05 : regime === "CHOPPY" ? 0.07 : 0.06;
+    const topThresh =
+      regime === "STREAK" ? 0.45 : regime === "CHOPPY" ? 0.42 : 0.43;
+    if (gap < gapThresh || top < topThresh) {
       // Thompson sampling
       const alpha: [number, number, number] = [
         counts[0] + 0.6,
@@ -1018,7 +1046,8 @@ export function useBinaryModel() {
         counts[2] + 0.6,
       ];
       const dir = sampleDirichlet(alpha);
-      const BLEND = 0.55;
+      const BLEND =
+        regime === "CHOPPY" ? 0.6 : regime === "STREAK" ? 0.5 : 0.55; // slightly more exploration in choppy
       dist = [
         (1 - BLEND) * dist[0] + BLEND * dir[0],
         (1 - BLEND) * dist[1] + BLEND * dir[1],
@@ -1032,7 +1061,9 @@ export function useBinaryModel() {
         Math.abs(dist[0] - 1 / 3) +
         Math.abs(dist[1] - 1 / 3) +
         Math.abs(dist[2] - 1 / 3);
-      if (dev < 0.12 && Math.random() < 0.07) {
+      const epsP =
+        regime === "CHOPPY" ? 0.1 : regime === "STREAK" ? 0.05 : 0.07;
+      if (dev < 0.12 && Math.random() < epsP) {
         let r = Math.random();
         for (let i = 0; i < 3; i++) {
           if (r < dist[i]) {
@@ -1097,6 +1128,56 @@ export function useBinaryModel() {
         (c + DOZEN_DIRICHLET_ALPHA) /
         (dozenHistory.length + 3 * DOZEN_DIRICHLET_ALPHA)
     ) as [number, number, number];
+    // --- Regime Detection (recent segment) ---
+    const REG_WINDOW = 40;
+    const seg = dozenHistory.slice(-REG_WINDOW);
+    if (seg.length >= 8) {
+      // compute run lengths
+      const runs: number[] = [];
+      let cur = 1;
+      for (let i = 1; i < seg.length; i++) {
+        if (seg[i] === seg[i - 1]) cur++;
+        else {
+          runs.push(cur);
+          cur = 1;
+        }
+      }
+      runs.push(cur);
+      const avgRun = runs.reduce((a, b) => a + b, 0) / runs.length;
+      const changeRate =
+        seg.length - 1 === 0
+          ? 0
+          : runs.length - 1 === 0
+          ? 0
+          : (seg.length - runs.reduce((a, b) => a + b, 0) + runs.length) /
+            (seg.length - 1); // fallback formula
+      // simpler: transitions / (len-1)
+      let transitions = 0;
+      for (let i = 1; i < seg.length; i++)
+        if (seg[i] !== seg[i - 1]) transitions++;
+      const transRate = transitions / (seg.length - 1);
+      // variance of runs
+      const mean = avgRun;
+      const runVar =
+        runs.reduce((a, r) => a + (r - mean) * (r - mean), 0) / runs.length;
+      // classify
+      let regime: "STREAK" | "CHOPPY" | "MIXED" = "MIXED";
+      if (avgRun >= 2.4 && transRate < 0.55) regime = "STREAK";
+      else if (avgRun < 1.8 && transRate >= 0.65) regime = "CHOPPY";
+      dozenRegimeRef.current = {
+        regime,
+        avgRun,
+        changeRate: transRate,
+        runVar,
+      };
+    } else {
+      dozenRegimeRef.current = {
+        regime: "MIXED",
+        avgRun: 0,
+        changeRate: 0,
+        runVar: 0,
+      };
+    }
     let modelProbs: [number, number, number] | null = null;
     if (dozenHistory.length >= windowSize) {
       modelProbs = tf.tidy(() => {
@@ -1244,6 +1325,31 @@ export function useBinaryModel() {
       bayes: manual.wBayes * dyn.bayes,
       entropyMod: manual.wEntropy * dyn.entropyMod,
     };
+    // Regime-based dynamic scaling
+    const regimeNow = dozenRegimeRef.current.regime;
+    const adj: Record<string, number> = {
+      model: 1,
+      markov: 1,
+      streak: 1,
+      pattern: 1,
+      ewma: 1,
+      bayes: 1,
+      entropyMod: 1,
+    };
+    if (regimeNow === "STREAK") {
+      adj.streak *= 1.25;
+      adj.pattern *= 1.2;
+      adj.markov *= 0.85;
+      adj.entropyMod *= 0.9;
+    } else if (regimeNow === "CHOPPY") {
+      adj.markov *= 1.25;
+      adj.entropyMod *= 1.15;
+      adj.streak *= 0.8;
+      adj.pattern *= 0.85;
+    }
+    Object.keys(weightMap).forEach((k) => {
+      weightMap[k] *= adj[k];
+    });
     // Performance gating: If model's recent pure accuracy (over last 30 spins) underperforms simple baselines, down-weight it dynamically.
     if (dozenModelPerfRef.current.total >= 15) {
       const recent = dozenRecentPredsRef.current.slice(-30);
@@ -1592,9 +1698,69 @@ export function useBinaryModel() {
       }
     }
     // Decision (confidence-aware & stochastic when low confidence)
-    const decide = chooseDozen(finalDist, counts as [number, number, number]);
+    // --- Early-phase accuracy guard ---
+    let guardActive = false;
+    if (dozenRecentPredsRef.current.length >= 12) {
+      const recentEval = dozenRecentPredsRef.current.slice(-18);
+      const rAcc =
+        recentEval.filter((r) => r.correct).length /
+        Math.max(1, recentEval.length);
+      if (rAcc < 0.32 && Math.max(...finalDist) < 0.55) {
+        // Blend with recent empirical frequency to stabilize
+        const FREQ_WIN = 30;
+        const seg = dozenHistory.slice(-FREQ_WIN);
+        if (seg.length >= 6) {
+          const fc = [0, 0, 0];
+          seg.forEach((v) => (fc[v] += 1));
+          const sumF = fc[0] + fc[1] + fc[2];
+          let freqDist: [number, number, number] = sumF
+            ? [fc[0] / sumF, fc[1] / sumF, fc[2] / sumF]
+            : [1 / 3, 1 / 3, 1 / 3];
+          // Light smoothing toward uniform to avoid extreme early swings
+          const SMOOTH = 0.25;
+          freqDist = [0, 1, 2].map(
+            (i) => (1 - SMOOTH) * freqDist[i] + SMOOTH * (1 / 3)
+          ) as [number, number, number];
+          const BLEND = 0.5; // strong correction when struggling
+          finalDist = [0, 1, 2].map(
+            (i) => (1 - BLEND) * finalDist[i] + BLEND * freqDist[i]
+          ) as [number, number, number];
+          guardActive = true;
+        }
+        // Per-class recent accuracy penalty (avoid tunneling on low performing class)
+        const rc = [0, 0, 0];
+        const rcCorrect = [0, 0, 0];
+        recentEval.forEach((r) => {
+          rc[r.label] = (rc[r.label] || 0) + 1;
+          if (r.correct) rcCorrect[r.label] = (rcCorrect[r.label] || 0) + 1;
+        });
+        for (let i = 0; i < 3; i++) {
+          const trials = rc[i];
+          if (trials >= 3) {
+            const acc = rcCorrect[i] / trials;
+            if (acc < 0.25 && finalDist[i] > 0.34) {
+              // below baseline & over uniform
+              finalDist[i] *= 0.78; // shrink
+            }
+          }
+        }
+        const sG = finalDist[0] + finalDist[1] + finalDist[2];
+        if (sG > 0)
+          finalDist = [finalDist[0] / sG, finalDist[1] / sG, finalDist[2] / sG];
+      }
+    }
+    if (guardActive) {
+      dozenGuardRef.current.triggers += 1;
+    }
+    dozenGuardRef.current.lastActive = guardActive;
+    const decide = chooseDozen(
+      finalDist,
+      counts as [number, number, number],
+      dozenRegimeRef.current.regime
+    );
     finalDist = decide.dist;
     const pred = decide.pred;
+    dozenDecisionInfoRef.current = decide.info;
     // Early anti-tunnel: if last two incorrect on same dozen with low prob, force alternate best
     if (
       dozenPredErrorStreakRef.current.last === pred &&
@@ -2202,6 +2368,9 @@ export function useBinaryModel() {
         incorrect: dozenPredErrorStreakRef.current.incorrect,
       },
       predFreq: dozenPredFreqRef.current,
+      regime: dozenRegimeRef.current,
+      decision: dozenDecisionInfoRef.current,
+      guard: dozenGuardRef.current,
     },
   };
 }
