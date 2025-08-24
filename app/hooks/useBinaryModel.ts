@@ -258,6 +258,7 @@ export function useBinaryModel() {
         kernelSize: 3,
         activation: "relu",
         padding: "same",
+        kernelRegularizer: tf.regularizers.l2({ l2: 1e-4 }),
       })
     );
     m.add(
@@ -266,14 +267,27 @@ export function useBinaryModel() {
         kernelSize: 5,
         activation: "relu",
         padding: "same",
+        kernelRegularizer: tf.regularizers.l2({ l2: 1e-4 }),
       })
     );
     m.add(tf.layers.dropout({ rate: 0.15 }));
     m.add(tf.layers.globalAveragePooling1d());
-    m.add(tf.layers.dense({ units: 24, activation: "relu" }));
-    m.add(tf.layers.dense({ units: 3, activation: "softmax" }));
+    m.add(
+      tf.layers.dense({
+        units: 24,
+        activation: "relu",
+        kernelRegularizer: tf.regularizers.l2({ l2: 1e-4 }),
+      })
+    );
+    m.add(
+      tf.layers.dense({
+        units: 3,
+        activation: "softmax",
+        kernelRegularizer: tf.regularizers.l2({ l2: 1e-4 }),
+      })
+    );
     m.compile({
-      optimizer: tf.train.adam(0.001),
+      optimizer: tf.train.adam(0.0007),
       loss: "categoricalCrossentropy",
     });
     return m;
@@ -856,13 +870,38 @@ export function useBinaryModel() {
 
   // Dozens training loop (multi-class)
   const dozenLastTrainRef = useRef(0);
-  const DOZEN_TRAIN_START = 8; // give a little more context before first CNN training
-  const DOZEN_TRAIN_EVERY = 2; // train every 2 spins for stability
+  // === Aggressive Dozens Tunables ===
+  const DOZEN_TRAIN_START = 5; // earlier start
+  const DOZEN_TRAIN_EVERY = 1; // train every spin once started
+  const DOZEN_MODEL_RAMP_SPINS = 12; // ramp model weight over 12 spins (was 30)
+  const DOZEN_INV_FREQ_GAMMA = 0.25; // softer inverse-frequency debias (was 0.4)
+  const DOZEN_ENTROPY_FLOOR = 0.7; // relaxed entropy floor (was 0.85)
+  const DOZEN_ENTROPY_STOP = 40; // stop entropy blending earlier (was 60)
+  const DOZEN_STREAK_DAMP_START = 7; // later dampening (was 5)
+  const DOZEN_STREAK_DAMP_MAX = 0.28; // slightly lower max damp (was 0.35)
+  const DOZEN_TEMP_START = 15; // start temperature sharpening
+  const DOZEN_TEMP_FULL = 60; // fully sharpen by this spin
+  const DOZEN_TEMP_MIN = 0.8; // final lower temperature (sharper)
+  const DOZEN_DIRICHLET_ALPHA = 0.6; // reduced pseudo-count (was implicit 1)
+  // ==================================
   // track prediction streak to damp persistent bias
   const dozenPredStreakRef = useRef<{ last: number | null; len: number }>({
     last: null,
     len: 0,
   });
+  // Track per-class prediction accuracy and model-only accuracy for gating
+  const dozenClassStatsRef = useRef<
+    Record<number, { correct: number; total: number }>
+  >({
+    0: { correct: 0, total: 0 },
+    1: { correct: 0, total: 0 },
+    2: { correct: 0, total: 0 },
+  });
+  const dozenModelPerfRef = useRef<{ correct: number; total: number }>({
+    correct: 0,
+    total: 0,
+  });
+  const dozenRecentPredsRef = useRef<{ label: number; correct: boolean }[]>([]);
   const trainAndPredictDozens = useCallback(async () => {
     const m = await ensureDozenModel();
     // If insufficient history for a window, still output a uniform distribution so UI has stable values.
@@ -905,7 +944,9 @@ export function useBinaryModel() {
     const counts = [0, 0, 0];
     dozenHistory.forEach((v) => (counts[v] += 1));
     const dirichlet = counts.map(
-      (c) => (c + 1) / (dozenHistory.length + 3)
+      (c) =>
+        (c + DOZEN_DIRICHLET_ALPHA) /
+        (dozenHistory.length + 3 * DOZEN_DIRICHLET_ALPHA)
     ) as [number, number, number];
     let modelProbs: [number, number, number] | null = null;
     if (dozenHistory.length >= windowSize) {
@@ -1042,7 +1083,9 @@ export function useBinaryModel() {
     // Ramp model weight in gradually to avoid early overfitting dominance
     const n = dozenHistory.length;
     const modelRamp =
-      n <= DOZEN_TRAIN_START ? 0 : Math.min(1, (n - DOZEN_TRAIN_START) / 30); // linear ramp over 30 spins
+      n <= DOZEN_TRAIN_START
+        ? 0
+        : Math.min(1, (n - DOZEN_TRAIN_START) / DOZEN_MODEL_RAMP_SPINS);
     const weightMap: Record<string, number> = {
       model: manual.wModel * modelRamp * dyn.model,
       markov: manual.wMarkov * dyn.markov,
@@ -1052,6 +1095,27 @@ export function useBinaryModel() {
       bayes: manual.wBayes * dyn.bayes,
       entropyMod: manual.wEntropy * dyn.entropyMod,
     };
+    // Performance gating: If model's recent pure accuracy (over last 30 spins) underperforms simple baselines, down-weight it dynamically.
+    if (dozenModelPerfRef.current.total >= 15) {
+      const recent = dozenRecentPredsRef.current.slice(-30);
+      if (recent.length) {
+        const acc =
+          recent.filter((r) => r.correct).length / Math.max(1, recent.length);
+        // baseline = max of (uniform 1/3, best class empirical freq)
+        const countsCopy = [...counts];
+        const freqMax = Math.max(countsCopy[0], countsCopy[1], countsCopy[2]);
+        const freqBaseline =
+          freqMax / Math.max(1, countsCopy[0] + countsCopy[1] + countsCopy[2]);
+        const baseline = Math.max(1 / 3, freqBaseline * 0.9); // small discount
+        if (acc < baseline) {
+          const penalty = Math.min(0.6, baseline - acc); // cap penalty
+          weightMap.model *= 1 - penalty; // shrink model influence
+        } else if (acc > baseline + 0.05) {
+          const bonus = Math.min(0.4, acc - baseline - 0.05);
+          weightMap.model *= 1 + bonus; // modest boost
+        }
+      }
+    }
     const sumW = Object.values(weightMap).reduce((a, b) => a + b, 0) || 1;
     Object.keys(weightMap).forEach((k) => (weightMap[k] /= sumW));
     // Blend via weighted log probs
@@ -1094,7 +1158,7 @@ export function useBinaryModel() {
     // 1. Inverse-frequency debias (mild) to prevent early lock-in
     const totalCounts = counts[0] + counts[1] + counts[2];
     if (totalCounts > 0) {
-      const gamma = 0.4; // debias strength
+      const gamma = DOZEN_INV_FREQ_GAMMA; // softer debias
       const invFreqWeights = counts.map((c) =>
         Math.pow((totalCounts + 3) / (c + 1), gamma)
       );
@@ -1110,12 +1174,12 @@ export function useBinaryModel() {
       0
     );
     const maxEnt = Math.log2(3);
-    const minAllowed = 0.85 * maxEnt; // encourage diversity
-    if (entropy < minAllowed && dozenHistory.length < 60) {
-      // blend toward uniform proportionally to deficit and data scarcity
-      const deficit = (minAllowed - entropy) / minAllowed; // 0..1
-      const scarcity = 1 - Math.min(dozenHistory.length / 60, 1); // 1 early -> 0 later
-      const blend = Math.min(0.6, deficit * 0.7 * scarcity);
+    const minAllowed = DOZEN_ENTROPY_FLOOR * maxEnt; // relaxed floor
+    if (entropy < minAllowed && dozenHistory.length < DOZEN_ENTROPY_STOP) {
+      const deficit = (minAllowed - entropy) / minAllowed;
+      const scarcity =
+        1 - Math.min(dozenHistory.length / DOZEN_ENTROPY_STOP, 1);
+      const blend = Math.min(0.4, deficit * 0.6 * scarcity);
       finalDist = [0, 1, 2].map(
         (i) => (1 - blend) * finalDist[i] + blend * (1 / 3)
       ) as [number, number, number];
@@ -1134,10 +1198,11 @@ export function useBinaryModel() {
       ps.last = topIdx;
       ps.len = 1;
     }
-    if (ps.len >= 5 && n < 120) {
-      // allow more persistence later when enough data
-      // damp top prob a bit and redistribute to others
-      const damp = Math.min(0.15 + (ps.len - 4) * 0.03, 0.35);
+    if (ps.len >= DOZEN_STREAK_DAMP_START && n < 120) {
+      const damp = Math.min(
+        0.12 + (ps.len - (DOZEN_STREAK_DAMP_START - 1)) * 0.025,
+        DOZEN_STREAK_DAMP_MAX
+      );
       const removed = finalDist[topIdx] * damp;
       const remain = finalDist[topIdx] - removed;
       const addEach = removed / 2;
@@ -1145,10 +1210,35 @@ export function useBinaryModel() {
         i === topIdx ? remain : finalDist[i] + addEach
       ) as [number, number, number];
     }
+    // Temperature sharpening (softmax^(1/T)) after dampening
+    if (n >= DOZEN_TEMP_START) {
+      const prog = Math.min(
+        1,
+        (n - DOZEN_TEMP_START) / Math.max(1, DOZEN_TEMP_FULL - DOZEN_TEMP_START)
+      );
+      const T = 0.95 - prog * (0.95 - DOZEN_TEMP_MIN);
+      const adj = finalDist.map((p) => Math.pow(Math.max(p, 1e-8), 1 / T));
+      const sAdj = adj.reduce((a, b) => a + b, 0);
+      if (sAdj > 0 && isFinite(sAdj)) {
+        finalDist = adj.map((v) => v / sAdj) as [number, number, number];
+      }
+    }
+    // Recompute argmax AFTER dampening & temperature sharpening. If it changed, reset streak counter to avoid mismatch.
+    const newTopIdx =
+      finalDist[0] >= finalDist[1] && finalDist[0] >= finalDist[2]
+        ? 0
+        : finalDist[1] >= finalDist[2]
+        ? 1
+        : 2;
+    if (newTopIdx !== topIdx) {
+      // Prediction flipped due to dampening/sharpening; reset streak tracking so new label isn't unfairly damped immediately.
+      ps.last = newTopIdx;
+      ps.len = 1;
+    }
     // 4. Final renormalize (safety)
     const fs = finalDist[0] + finalDist[1] + finalDist[2];
     finalDist = [finalDist[0] / fs, finalDist[1] / fs, finalDist[2] / fs];
-    const pred = topIdx;
+    const pred = newTopIdx;
     dozenProbsRef.current = finalDist;
     dozenPredictionRef.current = { probs: finalDist, predLabel: pred };
     setDozenVersion((v) => v + 1);
@@ -1524,6 +1614,26 @@ export function useBinaryModel() {
           correct,
         },
       ]);
+      // Track per-class stats (prediction correctness by predicted class)
+      if (snapshotLabel != null) {
+        const cls = snapshotLabel;
+        const rec = dozenClassStatsRef.current[cls];
+        rec.total += 1;
+        if (correct) rec.correct += 1;
+      }
+      // Track recent prediction list for dynamic gating window
+      if (snapshotLabel != null && correct != null) {
+        dozenRecentPredsRef.current.push({
+          label: snapshotLabel,
+          correct: !!correct,
+        });
+        if (dozenRecentPredsRef.current.length > 100) {
+          dozenRecentPredsRef.current.splice(
+            0,
+            dozenRecentPredsRef.current.length - 100
+          );
+        }
+      }
       setDozenHistory((h) => {
         if (h.length) {
           const last = h[h.length - 1];
@@ -1544,7 +1654,7 @@ export function useBinaryModel() {
       // RL weight update (multi-class) centered at 1/3 baseline using probability assigned to true label
       if (controlsRef.current.rlEnabled && dozenLastSourcesRef.current) {
         const srcDists = dozenLastSourcesRef.current;
-        const eta = controlsRef.current.rlEta * 0.9; // slightly gentler for multi-class
+        const eta = controlsRef.current.rlEta * 1.05; // slightly more aggressive multi-class RL
         (Object.keys(srcDists) as (keyof typeof srcDists)[]).forEach((k) => {
           const dist = srcDists[k];
           const pTrue = dist ? dist[d] : 1 / 3;
@@ -1570,6 +1680,11 @@ export function useBinaryModel() {
           if (correct) stat.correct += 1;
           dozenSourceStatsRef.current[k as string] = stat;
         });
+        // Update model-only performance (using model distribution probability of predicted label vs actual label)
+        if (srcDists.model) {
+          dozenModelPerfRef.current.total += 1;
+          if (correct) dozenModelPerfRef.current.correct += 1;
+        }
         // normalize
         const sum =
           Object.values(rlWeightsRef.current).reduce((a, b) => a + b, 0) || 1;
@@ -1626,5 +1741,36 @@ export function useBinaryModel() {
     rouletteDozenAccuracy: dozenAccRef.current.total
       ? dozenAccRef.current.correct / dozenAccRef.current.total
       : null,
+    rouletteDozenDiagnostics: {
+      classStats: {
+        0: {
+          acc: dozenClassStatsRef.current[0].total
+            ? dozenClassStatsRef.current[0].correct /
+              dozenClassStatsRef.current[0].total
+            : null,
+          total: dozenClassStatsRef.current[0].total,
+        },
+        1: {
+          acc: dozenClassStatsRef.current[1].total
+            ? dozenClassStatsRef.current[1].correct /
+              dozenClassStatsRef.current[1].total
+            : null,
+          total: dozenClassStatsRef.current[1].total,
+        },
+        2: {
+          acc: dozenClassStatsRef.current[2].total
+            ? dozenClassStatsRef.current[2].correct /
+              dozenClassStatsRef.current[2].total
+            : null,
+          total: dozenClassStatsRef.current[2].total,
+        },
+      },
+      modelPerf: {
+        acc: dozenModelPerfRef.current.total
+          ? dozenModelPerfRef.current.correct / dozenModelPerfRef.current.total
+          : null,
+        total: dozenModelPerfRef.current.total,
+      },
+    },
   };
 }
