@@ -883,12 +883,22 @@ export function useBinaryModel() {
   const DOZEN_TEMP_FULL = 60; // fully sharpen by this spin
   const DOZEN_TEMP_MIN = 0.8; // final lower temperature (sharper)
   const DOZEN_DIRICHLET_ALPHA = 0.6; // reduced pseudo-count (was implicit 1)
+  // Anti-tunnel / error-streak mitigation constants
+  const DOZEN_ERR_STREAK_PENALTY_START = 4; // start penalizing after 4 consecutive incorrect predictions of same dozen
+  const DOZEN_ERR_STREAK_PENALTY_STEP = 0.12; // incremental penalty fraction per extra miss beyond start
+  const DOZEN_ERR_STREAK_PENALTY_MAX = 0.55; // cap total penalty fraction removed from that dozen
+  const DOZEN_RECENT_PRED_WINDOW = 30; // window for recent per-class prediction accuracy gating
   // ==================================
   // track prediction streak to damp persistent bias
   const dozenPredStreakRef = useRef<{ last: number | null; len: number }>({
     last: null,
     len: 0,
   });
+  // track consecutive incorrect predictions for currently repeating predicted dozen
+  const dozenPredErrorStreakRef = useRef<{
+    last: number | null;
+    incorrect: number;
+  }>({ last: null, incorrect: 0 });
   // Track per-class prediction accuracy and model-only accuracy for gating
   const dozenClassStatsRef = useRef<
     Record<number, { correct: number; total: number }>
@@ -1192,6 +1202,30 @@ export function useBinaryModel() {
         : finalDist[1] >= finalDist[2]
         ? 1
         : 2;
+    // Anti-tunnel: penalize if we've repeatedly predicted this topIdx incorrectly many times in a row
+    const es = dozenPredErrorStreakRef.current;
+    if (
+      es.last === topIdx &&
+      es.incorrect >= DOZEN_ERR_STREAK_PENALTY_START &&
+      dozenHistory.length > 10
+    ) {
+      const over = es.incorrect - (DOZEN_ERR_STREAK_PENALTY_START - 1);
+      const frac = Math.min(
+        DOZEN_ERR_STREAK_PENALTY_MAX,
+        over * DOZEN_ERR_STREAK_PENALTY_STEP
+      );
+      const removed = finalDist[topIdx] * frac;
+      finalDist[topIdx] -= removed;
+      const addEach = removed / 2;
+      for (let i = 0; i < 3; i++) if (i !== topIdx) finalDist[i] += addEach;
+      // renormalize safety
+      const sAnti = finalDist[0] + finalDist[1] + finalDist[2];
+      finalDist = [
+        finalDist[0] / sAnti,
+        finalDist[1] / sAnti,
+        finalDist[2] / sAnti,
+      ];
+    }
     if (ps.last === topIdx) {
       ps.len += 1;
     } else {
@@ -1602,6 +1636,17 @@ export function useBinaryModel() {
         dozenAccRef.current.total += 1;
         if (correct) dozenAccRef.current.correct += 1;
       }
+      // Update error streak tracker
+      const es = dozenPredErrorStreakRef.current;
+      if (snapshotLabel != null) {
+        if (es.last === snapshotLabel) {
+          if (correct === false) es.incorrect += 1;
+          else if (correct) es.incorrect = 0;
+        } else {
+          es.last = snapshotLabel;
+          es.incorrect = correct === false ? 1 : 0;
+        }
+      }
       setDozenRecords((r) => [
         ...r,
         {
@@ -1770,6 +1815,10 @@ export function useBinaryModel() {
           ? dozenModelPerfRef.current.correct / dozenModelPerfRef.current.total
           : null,
         total: dozenModelPerfRef.current.total,
+      },
+      errorStreak: {
+        last: dozenPredErrorStreakRef.current.last,
+        incorrect: dozenPredErrorStreakRef.current.incorrect,
       },
     },
   };
