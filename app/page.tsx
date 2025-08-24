@@ -4,6 +4,7 @@ import React, { useState, useMemo } from "react";
 import { BinaryButtons } from "./components/BinaryButtons";
 import { ControlPanel } from "./components/ControlPanel";
 import { useBinaryModel } from "./hooks/useBinaryModel";
+import RecommendationPanel from "./components/RecommendationPanel";
 
 function DozensPanel({
   probs,
@@ -778,123 +779,36 @@ export default function Home() {
           )}
           {controls.mode === "roulette" &&
           controls.rouletteVariant === "dozens" ? (
-            <div className="mt-4 p-3 border border-slate-700 rounded bg-slate-900/40 h-48 overflow-y-auto text-[10px] font-mono flex flex-col gap-1">
-              {rouletteDozenRecords
-                .slice()
-                .reverse()
-                .map((r, i) => {
-                  const res =
-                    r.correct == null ? "—" : r.correct ? "WIN" : "LOSS";
-                  const color =
-                    r.correct == null
-                      ? "bg-slate-600/30 border-slate-600/50 text-slate-300"
-                      : r.correct
-                      ? "bg-emerald-600/30 border-emerald-500/40 text-emerald-200"
-                      : "bg-rose-700/30 border-rose-600/40 text-rose-200";
-                  const labelTxt =
-                    r.label === 0
-                      ? "1st 12"
-                      : r.label === 1
-                      ? "2nd 12"
-                      : "3rd 12";
-                  const predTxt =
-                    r.predLabel == null
-                      ? "n/a"
-                      : r.predLabel === 0
-                      ? "1st 12"
-                      : r.predLabel === 1
-                      ? "2nd 12"
-                      : "3rd 12";
-                  return (
-                    <div
-                      key={i}
-                      className={`flex items-center gap-2 px-2 py-1 rounded border ${color}`}
-                    >
-                      <span
-                        className={`text-[9px] px-1.5 py-0.5 rounded bg-teal-600/20 text-teal-200`}
-                      >
-                        {labelTxt}
-                      </span>
-                      <span className="text-slate-400">pred: {predTxt}</span>
-                      {r.probs && (
-                        <span className="text-slate-400">
-                          p={(Math.max(...r.probs) * 100).toFixed(1)}%
-                        </span>
-                      )}
-                      <span className="ml-auto font-semibold tracking-wide">
-                        {res}
-                      </span>
-                    </div>
-                  );
-                })}
-              {rouletteDozenRecords.length === 0 && (
-                <span className="text-slate-600">No observations yet.</span>
-              )}
-            </div>
+            <>
+              <DozensHistoryPanel records={rouletteDozenRecords} />
+              <RecommendationPanel
+                mode="dozens"
+                dozen={rouletteDozenRecords.map((r) => ({
+                  label: r.label as number,
+                  predLabel: r.predLabel as number | null,
+                  probs: r.probs as number[] | null,
+                  correct: r.correct,
+                }))}
+              />
+            </>
           ) : (
-            <div className="mt-4 p-3 border border-slate-700 rounded bg-slate-900/40 h-48 overflow-y-auto text-[10px] font-mono flex flex-col gap-1">
-              {records
-                .slice()
-                .reverse()
-                .map((r, i) => {
-                  const res =
-                    r.correct == null ? "—" : r.correct ? "WIN" : "LOSS";
-                  const color =
-                    r.correct == null
-                      ? "bg-slate-600/30 border-slate-600/50 text-slate-300"
-                      : r.correct
-                      ? "bg-emerald-600/30 border-emerald-500/40 text-emerald-200"
-                      : "bg-rose-700/30 border-rose-600/40 text-rose-200";
-                  const isRoulette = controls.mode === "roulette";
-                  const labelTxt = r.label
-                    ? isRoulette
-                      ? "RED"
-                      : "OVER"
-                    : isRoulette
-                    ? "BLACK"
-                    : "UNDER";
-                  const predTxt =
-                    r.predLabel == null
-                      ? "n/a"
-                      : r.predLabel
-                      ? isRoulette
-                        ? "RED"
-                        : "OVER"
-                      : isRoulette
-                      ? "BLACK"
-                      : "UNDER";
-                  return (
-                    <div
-                      key={i}
-                      className={`flex items-center gap-2 px-2 py-1 rounded border ${color}`}
-                    >
-                      <span
-                        className={`text-[9px] px-1.5 py-0.5 rounded ${
-                          r.label
-                            ? isRoulette
-                              ? "bg-red-600/30 text-red-300"
-                              : "bg-teal-500/30 text-teal-200"
-                            : isRoulette
-                            ? "bg-slate-500/30 text-slate-200"
-                            : "bg-cyan-500/20 text-cyan-200"
-                        }`}
-                      >
-                        {labelTxt}
-                      </span>
-                      <span className="text-slate-400">pred: {predTxt}</span>
-                      <span className="text-slate-400">
-                        p={r.prob == null ? "n/a" : (r.prob * 100).toFixed(1)}%
-                      </span>
-                      <span className="ml-auto font-semibold tracking-wide">
-                        {res}
-                      </span>
-                    </div>
-                  );
-                })}
-              {records.length === 0 && (
-                <span className="text-slate-600">No observations yet.</span>
-              )}
-            </div>
+            <>
+              <BinaryHistoryPanel
+                records={records}
+                isRoulette={controls.mode === "roulette"}
+              />
+              <RecommendationPanel
+                mode={
+                  controls.mode === "roulette" ? "roulette-binary" : "binary"
+                }
+                binary={records.map((r) => ({
+                  label: r.label,
+                  predLabel: r.predLabel,
+                  prob: r.prob,
+                  correct: r.correct,
+                }))}
+              />
+            </>
           )}
           <ControlPanel
             controls={controls}
@@ -924,6 +838,306 @@ export default function Home() {
             </div>
           )}
         </footer>
+      </div>
+    </div>
+  );
+}
+
+// Inline panels with copy buttons (HistoryList component not used here)
+function DozensHistoryPanel({
+  records,
+}: {
+  records: {
+    label?: number;
+    predLabel?: number | null;
+    correct: boolean | null;
+    probs?: number[] | null;
+  }[];
+}) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      // Plain text lines mirroring on-screen order (newest first)
+      const lines: string[] = [];
+      records
+        .slice()
+        .reverse()
+        .forEach((r, idx) => {
+          const labelTxt =
+            r.label === 0
+              ? "1st12"
+              : r.label === 1
+              ? "2nd12"
+              : r.label === 2
+              ? "3rd12"
+              : "?";
+          const predTxt =
+            r.predLabel == null
+              ? "n/a"
+              : r.predLabel === 0
+              ? "1st12"
+              : r.predLabel === 1
+              ? "2nd12"
+              : "3rd12";
+          const resTxt = r.correct == null ? "?" : r.correct ? "WIN" : "LOSS";
+          const topProb = r.probs
+            ? (Math.max(...r.probs) * 100).toFixed(1) + "%"
+            : "n/a";
+          const dist = r.probs
+            ? r.probs.map((p) => (p * 100).toFixed(1) + "%").join("/")
+            : "";
+          lines.push(
+            `#${
+              idx + 1
+            } actual=${labelTxt} pred=${predTxt} p=${topProb} dist=[${dist}] result=${resTxt}`
+          );
+        });
+      const txt = lines.join("\n");
+      await navigator.clipboard.writeText(txt);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch (e) {
+      console.error("Copy dozens history failed", e);
+    }
+  };
+  return (
+    <div className="mt-4 p-3 border border-slate-700 rounded bg-slate-900/40 h-48 text-[10px] font-mono flex flex-col">
+      <div className="flex items-center justify-between mb-1">
+        <span className="uppercase tracking-wide text-[9px] text-slate-400">
+          History
+        </span>
+        <button
+          onClick={copy}
+          disabled={!records.length}
+          className="px-2 py-0.5 rounded text-[9px] border border-slate-600/70 bg-slate-800/60 hover:border-teal-500/60 hover:text-teal-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+        >
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+      <div className="flex-1 overflow-y-auto flex flex-col gap-1">
+        {records
+          .slice()
+          .reverse()
+          .map((r, i) => {
+            const res = r.correct == null ? "—" : r.correct ? "WIN" : "LOSS";
+            const color =
+              r.correct == null
+                ? "bg-slate-600/30 border-slate-600/50 text-slate-300"
+                : r.correct
+                ? "bg-emerald-600/30 border-emerald-500/40 text-emerald-200"
+                : "bg-rose-700/30 border-rose-600/40 text-rose-200";
+            const labelTxt =
+              r.label === 0 ? "1st 12" : r.label === 1 ? "2nd 12" : "3rd 12";
+            const predTxt =
+              r.predLabel == null
+                ? "n/a"
+                : r.predLabel === 0
+                ? "1st 12"
+                : r.predLabel === 1
+                ? "2nd 12"
+                : "3rd 12";
+            return (
+              <div
+                key={i}
+                className={`px-2 py-1 rounded border ${color} flex flex-col gap-0.5`}
+                title="Dozens prediction record"
+              >
+                <div className="flex items-center gap-2">
+                  <span
+                    className={`text-[9px] px-1.5 py-0.5 rounded bg-teal-600/20 text-teal-200`}
+                  >
+                    {labelTxt}
+                  </span>
+                  <span className="text-slate-400">pred: {predTxt}</span>
+                  {r.probs && (
+                    <span className="text-slate-400">
+                      top {(Math.max(...r.probs) * 100).toFixed(1)}%
+                    </span>
+                  )}
+                  <span className="ml-auto font-semibold tracking-wide">
+                    {res}
+                  </span>
+                </div>
+                {r.probs && (
+                  <div className="text-[9px] text-slate-500 font-mono flex flex-wrap gap-2">
+                    {r.probs.map((p, pi) => {
+                      const pct = (p * 100).toFixed(1) + "%";
+                      const lab = pi === 0 ? "1st" : pi === 1 ? "2nd" : "3rd";
+                      const isPred = r.predLabel === pi;
+                      return (
+                        <span
+                          key={pi}
+                          className={isPred ? "text-teal-300" : ""}
+                        >
+                          {lab}:{pct}
+                        </span>
+                      );
+                    })}
+                    {(() => {
+                      const sorted = [...r.probs].sort((a, b) => b - a);
+                      if (sorted.length > 1) {
+                        const margin = ((sorted[0] - sorted[1]) * 100).toFixed(
+                          1
+                        );
+                        return (
+                          <span className="text-slate-400">Δ{margin}%</span>
+                        );
+                      }
+                      return null;
+                    })()}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        {!records.length && (
+          <span className="text-slate-600">No observations yet.</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function BinaryHistoryPanel({
+  records,
+  isRoulette,
+}: {
+  records: {
+    label?: number;
+    predLabel?: number | null;
+    correct: boolean | null;
+    prob?: number | null;
+  }[];
+  isRoulette: boolean;
+}) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      // Plain text lines mirroring on-screen order (newest first)
+      const lines: string[] = [];
+      records
+        .slice()
+        .reverse()
+        .forEach((r, idx) => {
+          const actual = r.label
+            ? isRoulette
+              ? "RED"
+              : "OVER"
+            : isRoulette
+            ? "BLACK"
+            : "UNDER";
+          const predTxt =
+            r.predLabel == null
+              ? "n/a"
+              : r.predLabel
+              ? isRoulette
+                ? "RED"
+                : "OVER"
+              : isRoulette
+              ? "BLACK"
+              : "UNDER";
+          const resTxt = r.correct == null ? "?" : r.correct ? "WIN" : "LOSS";
+          const pTxt = r.prob == null ? "n/a" : (r.prob * 100).toFixed(1) + "%";
+          lines.push(
+            `#${
+              idx + 1
+            } actual=${actual} pred=${predTxt} p=${pTxt} result=${resTxt}`
+          );
+        });
+      const txt = lines.join("\n");
+      await navigator.clipboard.writeText(txt);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch (e) {
+      console.error("Copy binary history failed", e);
+    }
+  };
+  return (
+    <div className="mt-4 p-3 border border-slate-700 rounded bg-slate-900/40 h-48 text-[10px] font-mono flex flex-col">
+      <div className="flex items-center justify-between mb-1">
+        <span className="uppercase tracking-wide text-[9px] text-slate-400">
+          History
+        </span>
+        <button
+          onClick={copy}
+          disabled={!records.length}
+          className="px-2 py-0.5 rounded text-[9px] border border-slate-600/70 bg-slate-800/60 hover:border-teal-500/60 hover:text-teal-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+        >
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+      <div className="flex-1 overflow-y-auto flex flex-col gap-1">
+        {records
+          .slice()
+          .reverse()
+          .map((r, i) => {
+            const res = r.correct == null ? "—" : r.correct ? "WIN" : "LOSS";
+            const color =
+              r.correct == null
+                ? "bg-slate-600/30 border-slate-600/50 text-slate-300"
+                : r.correct
+                ? "bg-emerald-600/30 border-emerald-500/40 text-emerald-200"
+                : "bg-rose-700/30 border-rose-600/40 text-rose-200";
+            const labelTxt = r.label
+              ? isRoulette
+                ? "RED"
+                : "OVER"
+              : isRoulette
+              ? "BLACK"
+              : "UNDER";
+            const predTxt =
+              r.predLabel == null
+                ? "n/a"
+                : r.predLabel
+                ? isRoulette
+                  ? "RED"
+                  : "OVER"
+                : isRoulette
+                ? "BLACK"
+                : "UNDER";
+            return (
+              <div
+                key={i}
+                className={`px-2 py-1 rounded border ${color} flex flex-col gap-0.5`}
+                title="Binary prediction record"
+              >
+                <div className="flex items-center gap-2">
+                  <span
+                    className={`text-[9px] px-1.5 py-0.5 rounded ${
+                      r.label
+                        ? isRoulette
+                          ? "bg-red-600/30 text-red-300"
+                          : "bg-teal-500/30 text-teal-200"
+                        : isRoulette
+                        ? "bg-slate-500/30 text-slate-200"
+                        : "bg-cyan-500/20 text-cyan-200"
+                    }`}
+                  >
+                    {labelTxt}
+                  </span>
+                  <span className="text-slate-400">pred: {predTxt}</span>
+                  <span className="text-slate-400">
+                    p={r.prob == null ? "n/a" : (r.prob * 100).toFixed(1)}%
+                  </span>
+                  <span className="ml-auto font-semibold tracking-wide">
+                    {res}
+                  </span>
+                </div>
+                {typeof r.prob === "number" && (
+                  <div className="text-[9px] text-slate-500 font-mono flex gap-3">
+                    <span>
+                      dist:[{(r.prob * 100).toFixed(1)}%/
+                      {((1 - r.prob) * 100).toFixed(1)}%]
+                    </span>
+                    <span>Δ{(Math.abs(r.prob - 0.5) * 200).toFixed(1)}%</span>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        {!records.length && (
+          <span className="text-slate-600">No observations yet.</span>
+        )}
       </div>
     </div>
   );

@@ -1002,6 +1002,39 @@ export function useBinaryModel() {
   const dozenRegretRef = useRef<[number, number, number]>([0, 0, 0]);
   const dozenHiConfWrongRef = useRef<number[]>([]); // 1 = high confidence wrong
   const dozenRecentWindowRef = useRef<number[]>([]); // recent actual outcomes
+  // Calibration & monitoring additions
+  const dozenCalibBufferRef = useRef<
+    {
+      probs: [number, number, number];
+      label: number;
+    }[]
+  >([]);
+  const dozenCalibAdjRef = useRef<{
+    mult: [number, number, number];
+    temp: number;
+  }>({ mult: [1, 1, 1], temp: 1 });
+  const dozenBrierWindowRef = useRef<number[]>([]); // per-spin multi-class Brier
+  const dozenConfusionRef = useRef<number[][]>([
+    [0, 0, 0],
+    [0, 0, 0],
+    [0, 0, 0],
+  ]);
+  // Rolling top-probability vs accuracy window (for overconfidence gap control)
+  const dozenTopProbWindowRef = useRef<{ p: number; correct: boolean }[]>([]);
+  // Cooldown after catastrophic high-confidence miss
+  const dozenHiProbCooldownRef = useRef<{ spins: number; factor: number }>({
+    spins: 0,
+    factor: 1,
+  });
+  // High-confidence outcome window (top prob >= threshold)
+  const dozenHiConfWindowRef = useRef<{ p: number; correct: boolean }[]>([]);
+  // Reliability running sums to compute multiplicative calibration factors
+  const dozenReliabilityRef = useRef<{
+    predSum: [number, number, number];
+    actual: [number, number, number];
+  }>({ predSum: [0, 0, 0], actual: [0, 0, 0] });
+  // Miss-streak diversion tracking (per predicted class)
+  const dozenPredMissStreakRef = useRef<[number, number, number]>([0, 0, 0]);
   // Regret / calibration constants
   const DZ_LOWCONF_GAP = 0.05;
   const DZ_LOWCONF_TOP = 0.45;
@@ -1013,6 +1046,18 @@ export function useBinaryModel() {
   const DZ_HICONF_WINDOW = 40;
   const DZ_HICONF_ERRRATE = 0.62;
   const DZ_MAJ_WINDOW = 12;
+  const DZ_CALIB_WINDOW = 60; // rolling window for calibration
+  const DZ_CALIB_MIN = 15; // minimum samples before applying adjustments
+  const DZ_CALIB_LR = 0.25; // learning rate for multiplicative reliability
+  const DZ_BRIER_WINDOW = 50;
+  const DZ_BRIER_BASELINE = 2 * (2 / 3) ** 2 + (1 / 3) ** 2; // baseline uniform multi-class Brier (~0.666...)
+  const DZ_BRIER_SHRINK_MAX = 0.35; // max pull toward uniform
+  const DZ_ANTICOLL_ENTROPY = 0.9; // entropy threshold (bits) to trigger temperature raising
+  const DZ_ANTICOLL_LASTN = 5; // accuracy window for anti-collapse
+  const DZ_ANTICOLL_MIN_ACC = 0.33; // baseline accuracy
+  const DZ_MISS_DIVERSION_GAP = 0.06; // gap threshold for miss-streak diversion
+  const DZ_EARLY_HICONF_CLAMP_BASE = 0.52; // initial clamp start
+  const DZ_HICONF_CLAMP_MIN = 0.48; // adaptive lower bound
 
   // === DOZENS DECISION HELPERS ===
   const sampleDirichlet = (
@@ -1264,6 +1309,30 @@ export function useBinaryModel() {
         out.dispose();
         return arr;
       });
+    }
+    // Apply rolling reliability calibration (simple multiplicative per-class + temperature) BEFORE other mixing
+    if (modelProbs) {
+      const calib = dozenCalibAdjRef.current;
+      const adj = modelProbs.map((p, i) => p * calib.mult[i]) as [
+        number,
+        number,
+        number
+      ];
+      let sAdj = adj[0] + adj[1] + adj[2];
+      if (sAdj > 0) {
+        let temp = calib.temp;
+        if (temp !== 1) {
+          const tAdj = adj.map((p) => Math.pow(Math.max(p, 1e-8), 1 / temp));
+          const st = tAdj[0] + tAdj[1] + tAdj[2];
+          modelProbs = [tAdj[0] / st, tAdj[1] / st, tAdj[2] / st] as [
+            number,
+            number,
+            number
+          ];
+        } else {
+          modelProbs = [adj[0] / sAdj, adj[1] / sAdj, adj[2] / sAdj];
+        }
+      }
     }
     // Markov distribution
     let markovDist: [number, number, number] = [1 / 3, 1 / 3, 1 / 3];
@@ -1575,6 +1644,47 @@ export function useBinaryModel() {
         }
       }
     }
+    // Miss-streak diversion pre-choice: if predicted class recently missed 2+ times and advantage small, rotate
+    const sortedPre = [...finalDist]
+      .map((p, i) => ({ i, p }))
+      .sort((a, b) => b.p - a.p);
+    if (sortedPre.length >= 2) {
+      const topIdx = sortedPre[0].i;
+      const secondIdx = sortedPre[1].i;
+      const gap = sortedPre[0].p - sortedPre[1].p;
+      if (
+        dozenPredMissStreakRef.current[topIdx] >= 2 &&
+        gap < DZ_MISS_DIVERSION_GAP
+      ) {
+        // divert probability mass to second
+        const transfer = Math.min(0.15, (DZ_MISS_DIVERSION_GAP - gap) * 1.2);
+        const amt = Math.min(finalDist[topIdx] * 0.4, transfer);
+        finalDist[topIdx] -= amt;
+        finalDist[secondIdx] += amt;
+        const ss = finalDist[0] + finalDist[1] + finalDist[2];
+        finalDist = [finalDist[0] / ss, finalDist[1] / ss, finalDist[2] / ss];
+      }
+    }
+    // Anti-collapse temperature raising (flatten) if low entropy & short-term accuracy under baseline
+    (function antiCollapse() {
+      const recent = dozenRecentPredsRef.current.slice(-DZ_ANTICOLL_LASTN);
+      if (recent.length >= DZ_ANTICOLL_LASTN) {
+        const acc = recent.filter((r) => r.correct).length / recent.length;
+        const ent = -finalDist.reduce(
+          (a, p) => (p > 0 ? a + p * Math.log2(p) : a),
+          0
+        );
+        if (ent < DZ_ANTICOLL_ENTROPY && acc < DZ_ANTICOLL_MIN_ACC) {
+          const deficit = Math.max(0, DZ_ANTICOLL_MIN_ACC - acc);
+          const raise = 1 + Math.min(0.6, deficit * 1.2); // temperature >1 flattens
+          const adj = finalDist.map((p) =>
+            Math.pow(Math.max(p, 1e-8), 1 / raise)
+          );
+          const sa = adj[0] + adj[1] + adj[2];
+          finalDist = [adj[0] / sa, adj[1] / sa, adj[2] / sa];
+        }
+      }
+    })();
     // Prediction imbalance mitigation: avoid over-predicting one dozen compared to its actual frequency.
     const recentPredsForImbal = dozenRecentPredsRef.current.slice(
       -DOZEN_PRED_IMBAL_WINDOW
@@ -2017,6 +2127,136 @@ export function useBinaryModel() {
         }
       }
     })();
+    // Adaptive hi-conf clamp earlier: compute dynamic clamp based on hi-conf wrong rate
+    (function adaptiveHiConfClamp() {
+      if (dozenHiConfWrongRef.current.length >= 8) {
+        const errRate =
+          dozenHiConfWrongRef.current.reduce((a, b) => a + b, 0) /
+          dozenHiConfWrongRef.current.length;
+        const dynamicClamp = Math.max(
+          DZ_HICONF_CLAMP_MIN,
+          DZ_EARLY_HICONF_CLAMP_BASE - Math.min(0.04, (errRate - 0.5) * 0.1)
+        );
+        const topIdx =
+          finalDist[0] >= finalDist[1] && finalDist[0] >= finalDist[2]
+            ? 0
+            : finalDist[1] >= finalDist[2]
+            ? 1
+            : 2;
+        if (finalDist[topIdx] > dynamicClamp) {
+          const excess = finalDist[topIdx] - dynamicClamp;
+          finalDist[topIdx] = dynamicClamp;
+          const others = [0, 1, 2].filter((i) => i !== topIdx);
+          finalDist[others[0]] += excess / 2;
+          finalDist[others[1]] += excess / 2;
+        }
+      }
+    })();
+    // Brier score watchdog shrink
+    (function brierShrink() {
+      if (dozenBrierWindowRef.current.length >= DZ_BRIER_WINDOW / 2) {
+        const recent = dozenBrierWindowRef.current.slice(-DZ_BRIER_WINDOW);
+        const avg = recent.reduce((a, b) => a + b, 0) / recent.length;
+        if (avg > DZ_BRIER_BASELINE) {
+          const excess = avg - DZ_BRIER_BASELINE;
+          // Dynamic shrink proportional to relative degradation
+          const rel = excess / DZ_BRIER_BASELINE; // ~0.05 => mild
+          const k = Math.min(
+            DZ_BRIER_SHRINK_MAX,
+            // base 0.15 plus scaled component
+            0.15 + rel * 0.9
+          );
+          finalDist = [0, 1, 2].map(
+            (i) => (1 - k) * finalDist[i] + k * (1 / 3)
+          ) as [number, number, number];
+        }
+      }
+    })();
+    // Adaptive overconfidence clamp based on realized gap history BEFORE decision helper
+    (function overconfidenceAdaptive() {
+      const w = dozenTopProbWindowRef.current.slice(-50);
+      if (w.length >= 15) {
+        const avgTop = w.reduce((a, r) => a + r.p, 0) / w.length;
+        const accTop = w.filter((r) => r.correct).length / w.length;
+        const gap = avgTop - accTop; // >0 => overconfident
+        if (gap > 0.04) {
+          // compute target cap relative to accuracy so probabilities cannot exceed plausible calibration
+          const dynamicCap = Math.min(
+            0.6,
+            Math.max(
+              0.38,
+              accTop + 0.07 + Math.min(0.06, (0.08 - Math.min(gap, 0.08)) * 0.4)
+            )
+          );
+          const topIdx =
+            finalDist[0] >= finalDist[1] && finalDist[0] >= finalDist[2]
+              ? 0
+              : finalDist[1] >= finalDist[2]
+              ? 1
+              : 2;
+          if (finalDist[topIdx] > dynamicCap) {
+            const excess = finalDist[topIdx] - dynamicCap;
+            finalDist[topIdx] = dynamicCap;
+            const others = [0, 1, 2].filter((i) => i !== topIdx);
+            finalDist[others[0]] += excess / 2;
+            finalDist[others[1]] += excess / 2;
+            const s = finalDist[0] + finalDist[1] + finalDist[2];
+            finalDist = [finalDist[0] / s, finalDist[1] / s, finalDist[2] / s];
+          }
+          // Flatten further via temperature raise depending on gap magnitude
+          const T = 1 + Math.min(0.7, (gap - 0.04) * 4); // up to 1.7
+          if (T > 1.01) {
+            const adj = finalDist.map((p) =>
+              Math.pow(Math.max(p, 1e-8), 1 / T)
+            );
+            const sT = adj[0] + adj[1] + adj[2];
+            finalDist = [adj[0] / sT, adj[1] / sT, adj[2] / sT];
+          }
+        } else if (gap < -0.05) {
+          // Underconfident: mild sharpening (temperature <1)
+          const T = Math.max(0.85, 1 + gap * 0.8); // gap negative
+          if (T < 0.995) {
+            const adj = finalDist.map((p) =>
+              Math.pow(Math.max(p, 1e-8), 1 / T)
+            );
+            const sT = adj[0] + adj[1] + adj[2];
+            finalDist = [adj[0] / sT, adj[1] / sT, adj[2] / sT];
+          }
+        }
+      }
+    })();
+    // High-probability miss cooldown flatten (applied if active)
+    if (dozenHiProbCooldownRef.current.spins > 0) {
+      const factor = dozenHiProbCooldownRef.current.factor; // >1 => flatten
+      const adj = finalDist.map((p) => Math.pow(Math.max(p, 1e-8), 1 / factor));
+      const sC = adj[0] + adj[1] + adj[2];
+      finalDist = [adj[0] / sC, adj[1] / sC, adj[2] / sC];
+      dozenHiProbCooldownRef.current.spins -= 1;
+    }
+    // Scheduled early confidence cap (progressively relaxes)
+    (function earlyConfidenceSchedule() {
+      if (n >= 3) {
+        const capStart = 0.5; // very early
+        const capEnd = 0.64; // later allowable cap
+        const prog = Math.min(1, n / 160);
+        const cap = capStart + (capEnd - capStart) * prog;
+        const topIdx =
+          finalDist[0] >= finalDist[1] && finalDist[0] >= finalDist[2]
+            ? 0
+            : finalDist[1] >= finalDist[2]
+            ? 1
+            : 2;
+        if (finalDist[topIdx] > cap) {
+          const excess = finalDist[topIdx] - cap;
+          finalDist[topIdx] = cap;
+          const others = [0, 1, 2].filter((i) => i !== topIdx);
+          finalDist[others[0]] += excess / 2;
+          finalDist[others[1]] += excess / 2;
+          const s = finalDist[0] + finalDist[1] + finalDist[2];
+          finalDist = [finalDist[0] / s, finalDist[1] / s, finalDist[2] / s];
+        }
+      }
+    })();
     const decide = chooseDozen(
       finalDist,
       counts as [number, number, number],
@@ -2411,6 +2651,110 @@ export function useBinaryModel() {
           correct,
         },
       ]);
+      // === Calibration / Reliability / Brier tracking ===
+      if (snapshotProbs) {
+        // Brier score update (multi-class)
+        const y = [0, 0, 0];
+        y[d] = 1;
+        let brier = 0;
+        for (let i = 0; i < 3; i++) brier += (snapshotProbs[i] - y[i]) ** 2;
+        dozenBrierWindowRef.current.push(brier);
+        if (dozenBrierWindowRef.current.length > DZ_BRIER_WINDOW) {
+          dozenBrierWindowRef.current.splice(
+            0,
+            dozenBrierWindowRef.current.length - DZ_BRIER_WINDOW
+          );
+        }
+        // Reliability running sums
+        const rel = dozenReliabilityRef.current;
+        rel.predSum[0] += snapshotProbs[0];
+        rel.predSum[1] += snapshotProbs[1];
+        rel.predSum[2] += snapshotProbs[2];
+        rel.actual[d] += 1;
+        // Rolling buffer for windowed calibration
+        dozenCalibBufferRef.current.push({ probs: snapshotProbs, label: d });
+        if (dozenCalibBufferRef.current.length > DZ_CALIB_WINDOW) {
+          dozenCalibBufferRef.current.splice(
+            0,
+            dozenCalibBufferRef.current.length - DZ_CALIB_WINDOW
+          );
+        }
+        // Top probability window (for overconfidence gap)
+        const topP = Math.max(...snapshotProbs);
+        dozenTopProbWindowRef.current.push({ p: topP, correct: !!correct });
+        if (dozenTopProbWindowRef.current.length > 90) {
+          dozenTopProbWindowRef.current.splice(
+            0,
+            dozenTopProbWindowRef.current.length - 90
+          );
+        }
+        // Track hi-confidence subset (>=0.45 threshold)
+        if (topP >= 0.45) {
+          dozenHiConfWindowRef.current.push({ p: topP, correct: !!correct });
+          if (dozenHiConfWindowRef.current.length > 120) {
+            dozenHiConfWindowRef.current.splice(
+              0,
+              dozenHiConfWindowRef.current.length - 120
+            );
+          }
+        }
+        // Perform calibration adjustments when enough samples
+        const calibWin = dozenCalibBufferRef.current;
+        if (calibWin.length >= DZ_CALIB_MIN) {
+          // Windowed sums
+          const sumP: [number, number, number] = [0, 0, 0];
+          const sumA: [number, number, number] = [0, 0, 0];
+          calibWin.forEach((rec) => {
+            sumP[0] += rec.probs[0];
+            sumP[1] += rec.probs[1];
+            sumP[2] += rec.probs[2];
+            sumA[rec.label] += 1;
+          });
+          // Update multiplicative reliability multipliers
+          for (let i = 0; i < 3; i++) {
+            if (sumP[i] > 0) {
+              const ratio = sumA[i] / sumP[i];
+              const old = dozenCalibAdjRef.current.mult[i];
+              const updated = old * (1 - DZ_CALIB_LR) + DZ_CALIB_LR * ratio;
+              dozenCalibAdjRef.current.mult[i] = Math.min(
+                1.6,
+                Math.max(0.6, updated)
+              );
+            }
+          }
+          // Temperature adaptation based on overconfidence gap (top prob vs accuracy)
+          const gapWindow = dozenTopProbWindowRef.current;
+          if (gapWindow.length >= 18) {
+            const avgTop =
+              gapWindow.reduce((a, r) => a + r.p, 0) / gapWindow.length;
+            const accTop =
+              gapWindow.filter((r) => r.correct).length / gapWindow.length;
+            const gap = avgTop - accTop; // positive => overconfident
+            let targetTemp = 1;
+            if (gap > 0.05) {
+              targetTemp = Math.min(1.5, 1 + (gap - 0.05) * 2.2);
+            } else if (gap < -0.04) {
+              // underconfident
+              targetTemp = Math.max(0.75, 1 + gap * 1.5);
+            }
+            // Smooth temperature transitions
+            dozenCalibAdjRef.current.temp =
+              0.7 * dozenCalibAdjRef.current.temp + 0.3 * targetTemp;
+          }
+        }
+        // Catastrophic high-prob miss triggers cooldown
+        if (!correct) {
+          const topP = Math.max(...snapshotProbs);
+          if (topP >= 0.6) {
+            // escalate flattening proportional to top probability
+            const severity = Math.min(1, (topP - 0.6) / 0.2); // 0..1 for 0.6..0.8
+            dozenHiProbCooldownRef.current = {
+              spins: 4 + Math.round(severity * 4), // 4-8 spins
+              factor: 1.2 + severity * 0.5, // flatten factor 1.2 - 1.7
+            };
+          }
+        }
+      }
       // Track per-class stats (prediction correctness by predicted class)
       if (snapshotLabel != null) {
         const cls = snapshotLabel;
