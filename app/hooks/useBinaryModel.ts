@@ -888,6 +888,11 @@ export function useBinaryModel() {
   const DOZEN_ERR_STREAK_PENALTY_STEP = 0.12; // incremental penalty fraction per extra miss beyond start
   const DOZEN_ERR_STREAK_PENALTY_MAX = 0.55; // cap total penalty fraction removed from that dozen
   const DOZEN_RECENT_PRED_WINDOW = 30; // window for recent per-class prediction accuracy gating
+  // Prediction imbalance mitigation
+  const DOZEN_PRED_IMBAL_WINDOW = 40; // window length for assessing prediction imbalance
+  const DOZEN_PRED_IMBAL_FACTOR = 1.35; // allowed multiple of actual share before penalizing
+  const DOZEN_PRED_IMBAL_MAX_SHARE = 0.55; // hard cap share guideline
+  const DOZEN_PRED_IMBAL_PENALTY_MAX = 0.4; // max portion to redistribute from dominant prediction
   // ==================================
   // track prediction streak to damp persistent bias
   const dozenPredStreakRef = useRef<{ last: number | null; len: number }>({
@@ -899,6 +904,7 @@ export function useBinaryModel() {
     last: number | null;
     incorrect: number;
   }>({ last: null, incorrect: 0 });
+  const dozenPredFreqRef = useRef<[number, number, number]>([0, 0, 0]);
   // Track per-class prediction accuracy and model-only accuracy for gating
   const dozenClassStatsRef = useRef<
     Record<number, { correct: number; total: number }>
@@ -1164,6 +1170,170 @@ export function useBinaryModel() {
         ];
       }
     }
+    // Prediction imbalance mitigation: avoid over-predicting one dozen compared to its actual frequency.
+    const recentPredsForImbal = dozenRecentPredsRef.current.slice(
+      -DOZEN_PRED_IMBAL_WINDOW
+    );
+    if (recentPredsForImbal.length >= 12) {
+      const predCounts = [0, 0, 0];
+      recentPredsForImbal.forEach((p) => {
+        if (p.label >= 0 && p.label <= 2) predCounts[p.label] += 1;
+      });
+      const predTot = predCounts[0] + predCounts[1] + predCounts[2];
+      const predShare = predTot
+        ? predCounts.map((c) => c / predTot)
+        : [1 / 3, 1 / 3, 1 / 3];
+      const recentActualSlice = dozenHistory.slice(-DOZEN_PRED_IMBAL_WINDOW);
+      const actCounts = [0, 0, 0];
+      recentActualSlice.forEach((v) => (actCounts[v] += 1));
+      const actTot = actCounts[0] + actCounts[1] + actCounts[2];
+      const actShare = actTot
+        ? actCounts.map((c) => c / actTot)
+        : [1 / 3, 1 / 3, 1 / 3];
+      dozenPredFreqRef.current = predShare as [number, number, number];
+      const curTop =
+        finalDist[0] >= finalDist[1] && finalDist[0] >= finalDist[2]
+          ? 0
+          : finalDist[1] >= finalDist[2]
+          ? 1
+          : 2;
+      const cap = Math.min(
+        DOZEN_PRED_IMBAL_MAX_SHARE,
+        actShare[curTop] * DOZEN_PRED_IMBAL_FACTOR + 0.05
+      );
+      if (predShare[curTop] > cap) {
+        const excess = predShare[curTop] - cap;
+        const penaltyFrac = Math.min(
+          DOZEN_PRED_IMBAL_PENALTY_MAX,
+          excess * 0.85
+        );
+        const removed = finalDist[curTop] * penaltyFrac;
+        finalDist[curTop] -= removed;
+        const others = [0, 1, 2].filter((i) => i !== curTop);
+        const shortfalls = others.map((i) =>
+          Math.max(0.001, cap - predShare[i])
+        );
+        const shortSum = shortfalls.reduce((a, b) => a + b, 0) || 1;
+        others.forEach((cls, idx) => {
+          finalDist[cls] += removed * (shortfalls[idx] / shortSum);
+        });
+        const s3 = finalDist[0] + finalDist[1] + finalDist[2];
+        finalDist = [finalDist[0] / s3, finalDist[1] / s3, finalDist[2] / s3];
+      }
+    } else {
+      dozenPredFreqRef.current = [0, 0, 0];
+    }
+    // === Recurring frequency & pattern strategy shaping ===
+    // 1. Long-window empirical frequency bias (favor a class that persistently appears more, unless contradicted by strong alternation pattern).
+    const FREQ_WINDOW = 60;
+    const freqSlice = dozenHistory.slice(-FREQ_WINDOW);
+    if (freqSlice.length >= 15) {
+      const fc = [0, 0, 0];
+      freqSlice.forEach((v) => (fc[v] += 1));
+      const ftot = fc[0] + fc[1] + fc[2];
+      if (ftot > 0) {
+        const fshare = fc.map((c) => c / ftot);
+        // Centered advantage over uniform
+        const adv = fshare.map((f) => f - 1 / 3);
+        // Soft boost: multiply distribution by exp(scale * adv)
+        const FREQ_BOOST_SCALE = 0.9; // aggressive but capped by renorm
+        const mult = adv.map((a) =>
+          Math.exp(Math.min(0.6, Math.max(-0.6, FREQ_BOOST_SCALE * a)))
+        );
+        for (let i = 0; i < 3; i++) finalDist[i] *= mult[i];
+        const sf = finalDist[0] + finalDist[1] + finalDist[2];
+        if (sf > 0) {
+          finalDist = [finalDist[0] / sf, finalDist[1] / sf, finalDist[2] / sf];
+        }
+      }
+    }
+    // 2. Alternation detection (simple ABAB or ABC rotation) to encourage switching when pattern strength high.
+    const ALT_LOOKBACK = 8;
+    const altSeq = dozenHistory.slice(-ALT_LOOKBACK);
+    let alternationExpected: number | null = null;
+    let alternationConfidence = 0;
+    if (altSeq.length >= 4) {
+      const uniq = Array.from(new Set(altSeq));
+      if (uniq.length === 2) {
+        // Test ABAB...
+        const a = altSeq[0];
+        const b = uniq.find((x) => x !== a)!;
+        let matches = 0;
+        for (let i = 0; i < altSeq.length; i++) {
+          const expect = i % 2 === 0 ? a : b;
+          if (altSeq[i] === expect) matches++;
+        }
+        const conf = matches / altSeq.length;
+        if (conf >= 0.65) {
+          const lastVal = altSeq[altSeq.length - 1];
+          alternationExpected = lastVal === a ? b : a;
+          alternationConfidence = conf;
+        }
+      } else if (uniq.length === 3) {
+        // Check simple cyclic pattern (e.g., abcabc)
+        const cycle = uniq; // approximate order by first occurrences
+        let cycMatches = 0;
+        for (let i = 0; i < altSeq.length; i++) {
+          const expect = cycle[i % 3];
+          if (altSeq[i] === expect) cycMatches++;
+        }
+        const cycConf = cycMatches / altSeq.length;
+        if (cycConf >= 0.7) {
+          const lastIdx = cycle.indexOf(altSeq[altSeq.length - 1]);
+          if (lastIdx >= 0) {
+            alternationExpected = cycle[(lastIdx + 1) % 3];
+            alternationConfidence = cycConf;
+          }
+        }
+      }
+    }
+    if (alternationExpected != null && alternationConfidence > 0) {
+      // Apply alternation encouragement: boost expected and soften others proportionally.
+      const ALT_BOOST_BASE = 0.25;
+      const boost = ALT_BOOST_BASE * alternationConfidence; // scaled 0..ALT_BOOST_BASE
+      const removed = boost * (1 - finalDist[alternationExpected]);
+      finalDist[alternationExpected] += removed;
+      const distribute = removed;
+      const others = [0, 1, 2].filter((i) => i !== alternationExpected);
+      // remove proportionally from others
+      let otherSum = others.reduce((a, i) => a + finalDist[i], 0);
+      if (otherSum > 0) {
+        others.forEach((i) => {
+          finalDist[i] -= (distribute * finalDist[i]) / otherSum;
+        });
+      }
+      const sAlt = finalDist[0] + finalDist[1] + finalDist[2];
+      finalDist = [
+        finalDist[0] / sAlt,
+        finalDist[1] / sAlt,
+        finalDist[2] / sAlt,
+      ];
+    }
+    // 3. Streak continuation vs break decision refinement: if current run length greater than 1 and alternation weak, reinforce continuation modestly.
+    if (alternationConfidence < 0.55 && dozenHistory.length >= 2) {
+      const lastVal = dozenHistory[dozenHistory.length - 1];
+      let rl2 = 1;
+      for (let i = dozenHistory.length - 2; i >= 0; i--) {
+        if (dozenHistory[i] === lastVal) rl2++;
+        else break;
+      }
+      if (rl2 >= 2) {
+        const STREAK_BOOST = Math.min(0.18, (rl2 - 1) * 0.04);
+        const gain = STREAK_BOOST * (1 - finalDist[lastVal]);
+        finalDist[lastVal] += gain;
+        const others = [0, 1, 2].filter((i) => i !== lastVal);
+        const oSum = others.reduce((a, i) => a + finalDist[i], 0) || 1;
+        others.forEach((i) => {
+          finalDist[i] -= gain * (finalDist[i] / oSum);
+        });
+        const sSt = finalDist[0] + finalDist[1] + finalDist[2];
+        finalDist = [
+          finalDist[0] / sSt,
+          finalDist[1] / sSt,
+          finalDist[2] / sSt,
+        ];
+      }
+    }
     // --- Debiasing & confidence shaping ---
     // 1. Inverse-frequency debias (mild) to prevent early lock-in
     const totalCounts = counts[0] + counts[1] + counts[2];
@@ -1264,6 +1434,40 @@ export function useBinaryModel() {
         : finalDist[1] >= finalDist[2]
         ? 1
         : 2;
+    // Hard cap: never allow more than 3 consecutive losses on same predicted dozen.
+    // If error streak for that dozen >=3 (already recorded before this spin) AND it would still predict same dozen, force pick best alternative.
+    if (
+      dozenPredErrorStreakRef.current.last === newTopIdx &&
+      dozenPredErrorStreakRef.current.incorrect >= 3
+    ) {
+      // choose alternative with highest probability among others
+      const altCandidates: { idx: number; p: number }[] = [0, 1, 2]
+        .filter((i) => i !== newTopIdx)
+        .map((i) => ({ idx: i, p: finalDist[i] }));
+      altCandidates.sort((a, b) => b.p - a.p);
+      if (altCandidates.length) {
+        const forced = altCandidates[0].idx;
+        // Transfer a portion of probability mass to reinforce forced switch
+        const SWITCH_PORTION = 0.15;
+        const transfer = Math.min(
+          SWITCH_PORTION,
+          finalDist[newTopIdx] * 0.5 // cap by probability share
+        );
+        finalDist[newTopIdx] -= transfer;
+        finalDist[forced] += transfer;
+        const sForce = finalDist[0] + finalDist[1] + finalDist[2];
+        finalDist = [
+          finalDist[0] / sForce,
+          finalDist[1] / sForce,
+          finalDist[2] / sForce,
+        ];
+        // treat as new top idx candidate
+        if (forced !== newTopIdx) {
+          ps.last = forced; // reset streak to avoid immediate damp
+          ps.len = 1;
+        }
+      }
+    }
     if (newTopIdx !== topIdx) {
       // Prediction flipped due to dampening/sharpening; reset streak tracking so new label isn't unfairly damped immediately.
       ps.last = newTopIdx;
@@ -1820,6 +2024,7 @@ export function useBinaryModel() {
         last: dozenPredErrorStreakRef.current.last,
         incorrect: dozenPredErrorStreakRef.current.incorrect,
       },
+      predFreq: dozenPredFreqRef.current,
     },
   };
 }
