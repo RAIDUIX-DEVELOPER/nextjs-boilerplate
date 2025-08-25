@@ -106,6 +106,8 @@ export function useBinaryModel() {
     floor: null,
     shrink: null,
   });
+  // Brier auto-shrink escalation state (tracks severity 0 none, 1 mild, 2 pronounced)
+  const dozenBrierAutoRef = useRef<{ level: 0 | 1 | 2 }>({ level: 0 });
   // Heuristic tracking for dozens
   const dozenMarkovRef = useRef([
     [1, 1, 1],
@@ -1047,7 +1049,37 @@ export function useBinaryModel() {
     changeRate: number;
     runVar: number;
   }>({ regime: "MIXED", avgRun: 0, changeRate: 0, runVar: 0 });
+  // Per-class prediction performance & pattern / tunnel tracking
+  interface ClassPredStat {
+    attempts: number;
+    wins: number;
+    sumTopProb: number;
+    consecMisses: number;
+    recent: { win: boolean; p: number }[];
+  }
+  const dozenClassPerfRef = useRef<ClassPredStat[]>([
+    { attempts: 0, wins: 0, sumTopProb: 0, consecMisses: 0, recent: [] },
+    { attempts: 0, wins: 0, sumTopProb: 0, consecMisses: 0, recent: [] },
+    { attempts: 0, wins: 0, sumTopProb: 0, consecMisses: 0, recent: [] },
+  ]);
+  const dozenTunnelWindowRef = useRef<{ cls: number; win: boolean }[]>([]);
+  const dozenPatternPerfRef = useRef<
+    Record<string, { tries: number; wins: number }>
+  >({});
+  const dozenPatternWindowRef = useRef<string[]>([]);
+  function dozenShapeHash(dist: number[]) {
+    const bins = dist
+      .map((p) => Math.min(19, Math.floor((p * 100) / 5)))
+      .join("-");
+    const order = dist
+      .map((p, i) => [p, i] as [number, number])
+      .sort((a, b) => b[0] - a[0])
+      .map((x) => x[1])
+      .join("");
+    return bins + "|" + order;
+  }
   // Last decision details for diagnostics
+  // (brierLevel appended later after final safety application)
   const dozenDecisionInfoRef = useRef<{
     method: string;
     gap: number;
@@ -1468,10 +1500,54 @@ export function useBinaryModel() {
     const inst: [number, number, number] = total
       ? [counts[0] / total, counts[1] / total, counts[2] / total]
       : [1 / 3, 1 / 3, 1 / 3];
+    // Adaptive EWMA alpha: emphasize recency <120 spins
+    const spinCount = dozenHistory.length;
+    const dynAlpha =
+      spinCount < 60
+        ? Math.min(0.22, alpha + 0.12)
+        : spinCount < 120
+        ? Math.min(0.16, alpha + 0.06)
+        : alpha;
     dozenEwmaRef.current = [0, 1, 2].map(
-      (i) => (1 - alpha) * (dozenEwmaRef.current as any)[i] + alpha * inst[i]
+      (i) =>
+        (1 - dynAlpha) * (dozenEwmaRef.current as any)[i] + dynAlpha * inst[i]
     ) as [number, number, number];
     const ewmaDist = dozenEwmaRef.current;
+    // Short vs Long frequency distributions
+    const SHORT_FREQ_WIN = 60;
+    const shortSlice = dozenHistory.slice(-SHORT_FREQ_WIN);
+    const shortCounts = [0, 0, 0];
+    shortSlice.forEach((v) => (shortCounts[v] += 1));
+    const shortTot = shortCounts[0] + shortCounts[1] + shortCounts[2];
+    const shortFreq: [number, number, number] = shortTot
+      ? [
+          shortCounts[0] / shortTot,
+          shortCounts[1] / shortTot,
+          shortCounts[2] / shortTot,
+        ]
+      : [1 / 3, 1 / 3, 1 / 3];
+    const longFreq: [number, number, number] = inst; // overall inst already normalized
+    // Lightweight recurrent (GRU-lite) hidden state capturing recent predictive context
+    const recurRef = (dozenGuardRef as any).current?.recurHidden || {
+      h: [1 / 3, 1 / 3, 1 / 3],
+    };
+    const recurAlpha = spinCount < 80 ? 0.18 : spinCount < 200 ? 0.12 : 0.08;
+    for (let i = 0; i < 3; i++)
+      recurRef.h[i] =
+        (1 - recurAlpha) * recurRef.h[i] + recurAlpha * ewmaDist[i];
+    const hSum = recurRef.h[0] + recurRef.h[1] + recurRef.h[2];
+    if (hSum > 0) {
+      for (let i = 0; i < 3; i++) recurRef.h[i] /= hSum;
+    }
+    (dozenGuardRef as any).current = {
+      ...(dozenGuardRef as any).current,
+      recurHidden: recurRef,
+    };
+    const recurDist: [number, number, number] = [
+      recurRef.h[0],
+      recurRef.h[1],
+      recurRef.h[2],
+    ];
     // Entropy modulation: push distribution toward last value when low entropy
     let entropyDist: [number, number, number] = [1 / 3, 1 / 3, 1 / 3];
     if (dozenHistory.length) {
@@ -1501,6 +1577,9 @@ export function useBinaryModel() {
       ewma: ewmaDist,
       bayes: dirichlet,
       entropyMod: entropyDist,
+      shortFreq,
+      longFreq,
+      recur: recurDist,
     };
     dozenLastSourcesRef.current = sources; // snapshot for RL update
     // Weighting (manual * RL if enabled)
@@ -1514,6 +1593,9 @@ export function useBinaryModel() {
           ewma: 1,
           bayes: 1,
           entropyMod: 1,
+          shortFreq: 1,
+          longFreq: 1,
+          recur: 1,
         };
     const manual = controlsRef.current;
     // Ramp model weight in gradually to avoid early overfitting dominance
@@ -1577,6 +1659,34 @@ export function useBinaryModel() {
         }
       }
     }
+    // Chi-squared bias detection on last 100 spins to tilt shortFreq/recur early
+    (function biasTilt() {
+      const win = dozenHistory.slice(-100);
+      if (win.length >= 40) {
+        const c = [0, 0, 0];
+        win.forEach((v) => c[v]++);
+        const n = win.length;
+        const exp = n / 3;
+        let chi = 0;
+        for (let i = 0; i < 3; i++) chi += ((c[i] - exp) * (c[i] - exp)) / exp;
+        // df=2 approx p-value (1 - CDF) using series expansion
+        const p = Math.exp(-0.5 * chi) * (1 + chi / 2);
+        const threshold = spinCount < 200 ? 0.05 : 0.01;
+        if (p < threshold) {
+          const biasIdx = c.indexOf(Math.max(...c));
+          weightMap.shortFreq *= 1.15;
+          weightMap.recur *= 1.1;
+          // slight de-emphasis long sources to exploit temporary bias
+          weightMap.longFreq *= 0.95;
+          weightMap.markov *= 0.96;
+          weightMap.bayes *= 0.96;
+        }
+      }
+    })();
+    // RL decay (forget older adjustments very slowly)
+    Object.keys(rlWeightsRef.current).forEach((k) => {
+      rlWeightsRef.current[k as keyof typeof rlWeightsRef.current] *= 0.998; // ~0.2 decay per 100 spins
+    });
     const sumW = Object.values(weightMap).reduce((a, b) => a + b, 0) || 1;
     Object.keys(weightMap).forEach((k) => (weightMap[k] /= sumW));
     // Blend via weighted log probs
@@ -2232,8 +2342,182 @@ export function useBinaryModel() {
           finalDist = [0, 1, 2].map(
             (i) => (1 - k) * finalDist[i] + k * (1 / 3)
           ) as [number, number, number];
+          // Escalation: track sustained elevation and apply additional uniform blend + flattening
+          let targetLevel: 0 | 1 | 2 = 0;
+          if (avg > DZ_BRIER_BASELINE + 0.015)
+            targetLevel = 2; // pronounced miscalibration
+          else if (avg > DZ_BRIER_BASELINE + 0.008) targetLevel = 1; // mild
+          const cur = dozenBrierAutoRef.current.level;
+          if (targetLevel > cur) {
+            dozenBrierAutoRef.current.level = (cur + 1) as 0 | 1 | 2; // step up one level only
+          } else if (targetLevel < cur) {
+            // step down only when comfortably recovered
+            if (avg < DZ_BRIER_BASELINE + 0.006) {
+              dozenBrierAutoRef.current.level = (cur - 1) as 0 | 1 | 2;
+            }
+          }
+          const eff = dozenBrierAutoRef.current.level;
+          if (eff > 0) {
+            const autoBlend = eff === 1 ? 0.1 : 0.18;
+            for (let i = 0; i < 3; i++) {
+              finalDist[i] =
+                (1 - autoBlend) * finalDist[i] + autoBlend * (1 / 3);
+            }
+            const T = eff === 1 ? 1.1 : 1.25;
+            const adj = finalDist.map((p) =>
+              Math.pow(Math.max(p, 1e-8), 1 / T)
+            );
+            const sT = adj[0] + adj[1] + adj[2];
+            finalDist = [adj[0] / sT, adj[1] / sT, adj[2] / sT];
+          }
         }
       }
+    })();
+    // Reliability & anti-tunnel shaping (pre overconfidence adaptive)
+    (function reliabilityAndExploration() {
+      const stats = dozenClassPerfRef.current;
+      if (!finalDist) return;
+      // Compute reliability ratios acc / meanProb (clamped) after minimum samples
+      const reliability = [0, 1, 2].map((i) => {
+        const s = stats[i];
+        if (s.attempts < 8) return 1;
+        const acc = s.wins / Math.max(1, s.attempts);
+        const meanP = s.sumTopProb / Math.max(1e-6, s.attempts);
+        return Math.max(0.4, Math.min(1.25, acc / Math.max(0.01, meanP)));
+      });
+      // Overconfidence gap proxy from top prob window for alpha
+      const gapWindow = dozenTopProbWindowRef.current.slice(-50);
+      let gap = 0;
+      if (gapWindow.length >= 15) {
+        const avgTop =
+          gapWindow.reduce((a, r) => a + r.p, 0) / gapWindow.length;
+        const accTop =
+          gapWindow.filter((r) => r.correct).length / gapWindow.length;
+        gap = avgTop - accTop;
+      }
+      const avgBrier = (() => {
+        const arr = dozenBrierWindowRef.current.slice(-40);
+        if (!arr.length) return DZ_BRIER_BASELINE;
+        return arr.reduce((a, b) => a + b, 0) / arr.length;
+      })();
+      const alpha =
+        0.9 +
+        (gap > 0.03 ? Math.min(0.8, (gap - 0.03) * 5) : 0) +
+        (avgBrier > DZ_BRIER_BASELINE + 0.012 ? 0.25 : 0);
+      let adj = [...finalDist];
+      for (let i = 0; i < 3; i++) {
+        const r = reliability[i];
+        const missStreak = stats[i].consecMisses;
+        let logit = Math.log(Math.max(1e-9, adj[i]));
+        logit += Math.log(r) * alpha;
+        if (missStreak >= 2) {
+          const penalty = Math.max(0.55, 1 - 0.15 * (missStreak - 1));
+          logit += Math.log(penalty);
+        }
+        adj[i] = Math.exp(logit);
+      }
+      // Normalize
+      let sum = adj[0] + adj[1] + adj[2];
+      if (!(sum > 0)) adj = [1 / 3, 1 / 3, 1 / 3];
+      else adj = adj.map((p) => p / sum) as typeof adj;
+      // Tunnel detection: last 6 predictions identical & low acc
+      const tw = dozenTunnelWindowRef.current;
+      const k = 6;
+      if (tw.length >= k) {
+        const last = tw.slice(-k);
+        const same = last.every((x) => x.cls === last[0].cls);
+        if (same) {
+          const acc = last.filter((x) => x.win).length / k;
+          if (acc < 0.34) {
+            const blend = Math.min(0.35, (0.34 - acc) * 1.2);
+            for (let i = 0; i < 3; i++)
+              adj[i] = adj[i] * (1 - blend) + blend / 3;
+          }
+        }
+      }
+      // Pattern repetition damp: repeated low-performing shape
+      const h = dozenShapeHash(adj);
+      dozenPatternWindowRef.current.push(h);
+      if (dozenPatternWindowRef.current.length > 30)
+        dozenPatternWindowRef.current.splice(
+          0,
+          dozenPatternWindowRef.current.length - 30
+        );
+      if (!dozenPatternPerfRef.current[h])
+        dozenPatternPerfRef.current[h] = { tries: 0, wins: 0 };
+      // (wins updated after outcome)
+      const counts: Record<string, number> = {};
+      dozenPatternWindowRef.current.forEach(
+        (ph) => (counts[ph] = (counts[ph] || 0) + 1)
+      );
+      let damp = 0;
+      for (const key in counts) {
+        if (counts[key] >= 3) {
+          const perf = dozenPatternPerfRef.current[key];
+          const acc = perf.tries ? perf.wins / perf.tries : 1;
+          if (perf.tries >= 3 && acc < 0.34) {
+            damp = Math.max(damp, 0.2);
+          }
+        }
+      }
+      if (damp > 0) {
+        for (let i = 0; i < 3; i++) adj[i] = adj[i] * (1 - damp) + damp / 3;
+      }
+      // Dynamic floor raise to prevent collapse
+      const baseFloor = 0.055;
+      const minFloor = Math.min(
+        0.18,
+        Math.max(
+          baseFloor,
+          baseFloor +
+            gap * 0.5 +
+            (avgBrier > DZ_BRIER_BASELINE + 0.015 ? 0.02 : 0)
+        )
+      );
+      let add = 0;
+      for (let i = 0; i < 3; i++)
+        if (adj[i] < minFloor) {
+          add += minFloor - adj[i];
+          adj[i] = minFloor;
+        }
+      if (add > 0) {
+        let surplus = 0;
+        const over: number[] = [];
+        for (let i = 0; i < 3; i++) {
+          const s = adj[i] - minFloor;
+          if (s > 1e-6) {
+            surplus += s;
+            over.push(i);
+          }
+        }
+        if (surplus > 0) {
+          over.forEach((i) => {
+            const share = (adj[i] - minFloor) / surplus;
+            adj[i] -= share * add;
+          });
+        }
+      }
+      // Exploration: if top-second gap small & reliability of top <0.9 soften
+      const sorted = adj
+        .map((p, i) => [p, i] as [number, number])
+        .sort((a, b) => b[0] - a[0]);
+      if (
+        sorted[0][0] - sorted[1][0] < 0.04 &&
+        reliability[sorted[0][1]] < 0.9
+      ) {
+        const soften = 0.5 * (0.04 - (sorted[0][0] - sorted[1][0]));
+        adj[sorted[0][1]] -= soften;
+        adj[sorted[1][1]] += soften;
+      }
+      // Final normalize after shaping
+      const s2 = adj[0] + adj[1] + adj[2];
+      finalDist = [adj[0] / s2, adj[1] / s2, adj[2] / s2];
+      // expose debug metrics
+      (dozenAdaptiveRef.current as any).classReliability = reliability;
+      (dozenAdaptiveRef.current as any).minFloorDyn = Math.min.apply(
+        null,
+        finalDist
+      );
     })();
     // Adaptive overconfidence clamp based on realized gap history BEFORE decision helper
     (function overconfidenceAdaptive() {
@@ -2455,6 +2739,8 @@ export function useBinaryModel() {
       dozenAdaptiveRef.current.cap = cap;
       dozenAdaptiveRef.current.floor = floor;
       if (appliedShrink > 0) dozenAdaptiveRef.current.shrink = appliedShrink;
+      (dozenAdaptiveRef.current as any).brierLevel =
+        dozenBrierAutoRef.current.level;
     })();
     dozenProbsRef.current = finalDist;
     setDozenVersion((v) => v + 1);
@@ -2918,6 +3204,33 @@ export function useBinaryModel() {
         const rec = dozenClassStatsRef.current[cls];
         rec.total += 1;
         if (correct) rec.correct += 1;
+      }
+      // Update extended per-class performance structures & tunnel/pattern stats
+      if (snapshotLabel != null && snapshotProbs) {
+        const perf = dozenClassPerfRef.current[snapshotLabel];
+        perf.attempts += 1;
+        if (correct) perf.wins += 1;
+        perf.sumTopProb += snapshotProbs[snapshotLabel];
+        perf.recent.push({ win: !!correct, p: snapshotProbs[snapshotLabel] });
+        if (perf.recent.length > 60) perf.recent.shift();
+        if (!correct) perf.consecMisses += 1;
+        else perf.consecMisses = 0;
+        // Tunnel window
+        dozenTunnelWindowRef.current.push({
+          cls: snapshotLabel,
+          win: !!correct,
+        });
+        if (dozenTunnelWindowRef.current.length > 15)
+          dozenTunnelWindowRef.current.splice(
+            0,
+            dozenTunnelWindowRef.current.length - 15
+          );
+        // Pattern perf (now that outcome known) using last distribution hash stored earlier at prediction time via shapeHash of snapshotProbs
+        const ph = dozenShapeHash(snapshotProbs);
+        if (!dozenPatternPerfRef.current[ph])
+          dozenPatternPerfRef.current[ph] = { tries: 0, wins: 0 };
+        dozenPatternPerfRef.current[ph].tries += 1;
+        if (correct) dozenPatternPerfRef.current[ph].wins += 1;
       }
       // Update miss streak & recent results for decision temperature
       if (snapshotLabel != null) {
