@@ -96,6 +96,16 @@ export function useBinaryModel() {
     probs: [number, number, number] | null;
     predLabel: 0 | 1 | 2 | null;
   }>({ probs: null, predLabel: null });
+  // Adaptive metrics (exposed to UI for diagnostics)
+  const dozenAdaptiveRef = useRef<{
+    cap: number | null;
+    floor: number | null;
+    shrink: number | null;
+  }>({
+    cap: null,
+    floor: null,
+    shrink: null,
+  });
   // Heuristic tracking for dozens
   const dozenMarkovRef = useRef([
     [1, 1, 1],
@@ -348,6 +358,56 @@ export function useBinaryModel() {
     if (!dozenModelRef.current) dozenModelRef.current = buildDozenModel();
     return dozenModelRef.current;
   }, [ensureBackend]);
+
+  // Restore persisted reliability & gap windows
+  useEffect(() => {
+    try {
+      const persisted = localStorage.getItem("dz_rel_calib_v1");
+      if (persisted) {
+        const obj = JSON.parse(persisted);
+        if (obj && Array.isArray(obj.mult) && obj.mult.length === 3) {
+          dozenCalibAdjRef.current.mult = obj.mult.map((m: number) =>
+            Math.min(1.6, Math.max(0.6, m))
+          ) as [number, number, number];
+        }
+        if (typeof obj.temp === "number") {
+          dozenCalibAdjRef.current.temp = Math.min(
+            1.6,
+            Math.max(0.7, obj.temp)
+          );
+        }
+      }
+      const topWin = localStorage.getItem("dz_topprob_win_v1");
+      if (topWin) {
+        const arr = JSON.parse(topWin);
+        if (Array.isArray(arr)) {
+          dozenTopProbWindowRef.current = arr
+            .filter(
+              (r: any) =>
+                r && typeof r.p === "number" && typeof r.correct === "boolean"
+            )
+            .slice(-90);
+        }
+      }
+    } catch {}
+    const handleBeforeUnload = () => {
+      try {
+        localStorage.setItem(
+          "dz_rel_calib_v1",
+          JSON.stringify({
+            mult: dozenCalibAdjRef.current.mult,
+            temp: dozenCalibAdjRef.current.temp,
+          })
+        );
+        localStorage.setItem(
+          "dz_topprob_win_v1",
+          JSON.stringify(dozenTopProbWindowRef.current.slice(-90))
+        );
+      } catch {}
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, []);
 
   const buildDozenFeatureWindow = useCallback(
     (seq: (0 | 1 | 2)[]): number[][] => {
@@ -1118,8 +1178,11 @@ export function useBinaryModel() {
     if (rec.length >= 12) {
       const acc = rec.filter((r) => r.correct).length / rec.length;
       let T = 1.0;
-      if (acc < 0.3) T = 1.15; // flatten (explore more)
-      else if (acc > 0.4) T = 0.88; // sharpen (exploit)
+      // Escalated flattening when recent accuracy is materially below random baseline (~0.33)
+      if (acc < 0.26) T = 1.35; // heavy flatten – severe slump
+      else if (acc < 0.3) T = 1.2; // moderate slump
+      else if (acc < 0.33) T = 1.1; // slight underperformance
+      else if (acc > 0.42) T = 0.85; // sharpen (exploit) only on clear strength
       if (T !== 1) {
         const adj = dist.map((p) => Math.pow(Math.max(p, 1e-8), 1 / T));
         const sT = adj.reduce((a, b) => a + b, 0);
@@ -2299,6 +2362,100 @@ export function useBinaryModel() {
     } else {
       dozenPredictionRef.current = { probs: finalDist, predLabel: pred };
     }
+    // --- FINAL POST-CHOICE SAFETY CLAMP & BRIER SYNERGY FLATTEN ---
+    (function finalSafety() {
+      // Stronger global cap applied AFTER chooseDozen and all shaping, so later steps cannot re-sharpen unchecked.
+      const gapWindow = dozenTopProbWindowRef.current.slice(-60);
+      let accTop = 0;
+      let avgTop = 0;
+      if (gapWindow.length >= 15) {
+        avgTop = gapWindow.reduce((a, r) => a + r.p, 0) / gapWindow.length;
+        accTop = gapWindow.filter((r) => r.correct).length / gapWindow.length;
+      }
+      const gap = avgTop - accTop;
+      // Derive dynamic cap referencing realized accuracy; tighter if gap large or recent slump.
+      let baseCap = accTop > 0 ? accTop + 0.07 : 0.4;
+      if (gap > 0.08) baseCap = accTop + 0.05; // heavy overconfidence – tighter
+      else if (gap > 0.05) baseCap = accTop + 0.06;
+      // Guardrails
+      const nSpins = dozenHistory.length;
+      const maxCap = nSpins < 160 ? 0.58 : 0.6; // relax slightly later
+      const minCap = 0.36;
+      let cap = Math.min(maxCap, Math.max(minCap, baseCap));
+      // Hi-confidence accuracy gating: if hi-conf subset underperforms, clip further
+      const hi = dozenHiConfWindowRef.current.slice(-70);
+      if (hi.length >= 12) {
+        const hiAcc = hi.filter((r) => r.correct).length / hi.length;
+        if (hiAcc < 0.4) cap -= 0.02;
+        if (hiAcc < 0.34) cap -= 0.02; // deeper penalty
+      }
+      cap = Math.min(maxCap, Math.max(minCap, cap));
+      // Apply cap if needed
+      const topIdx =
+        finalDist[0] >= finalDist[1] && finalDist[0] >= finalDist[2]
+          ? 0
+          : finalDist[1] >= finalDist[2]
+          ? 1
+          : 2;
+      if (finalDist[topIdx] > cap) {
+        const excess = finalDist[topIdx] - cap;
+        finalDist[topIdx] = cap;
+        const others = [0, 1, 2].filter((i) => i !== topIdx);
+        finalDist[others[0]] += excess / 2;
+        finalDist[others[1]] += excess / 2;
+      }
+      // Strengthened Brier-based flatten (synergy with gap): if average Brier over window still > baseline, blend further toward uniform.
+      let appliedShrink = 0;
+      if (dozenBrierWindowRef.current.length >= DZ_BRIER_WINDOW / 2) {
+        const recentB = dozenBrierWindowRef.current.slice(-DZ_BRIER_WINDOW);
+        const bAvg = recentB.reduce((a, b) => a + b, 0) / recentB.length;
+        if (bAvg > DZ_BRIER_BASELINE + 0.01) {
+          const rel = (bAvg - DZ_BRIER_BASELINE) / DZ_BRIER_BASELINE; // relative degradation
+          // Increase shrink ceiling when both gap & Brier poor
+          const gapBoost = gap > 0.06 ? 0.15 : gap > 0.04 ? 0.07 : 0;
+          const k = Math.min(0.45, 0.18 + rel * 1.1 + gapBoost);
+          appliedShrink = k;
+          for (let i = 0; i < 3; i++) {
+            finalDist[i] = (1 - k) * finalDist[i] + k * (1 / 3);
+          }
+        }
+      }
+      // Probability floor to avoid near-elimination of any class (prevents catastrophic low coverage raising Brier when that class hits)
+      const FLOOR_BASE = 0.055;
+      const floor = gap > 0.06 ? FLOOR_BASE + 0.015 : FLOOR_BASE;
+      let added = 0;
+      for (let i = 0; i < 3; i++) {
+        if (finalDist[i] < floor) {
+          added += floor - finalDist[i];
+          finalDist[i] = floor;
+        }
+      }
+      if (added > 0) {
+        // remove proportionally from over-floor classes
+        let surplusIdx: number[] = [];
+        let surplusTotal = 0;
+        for (let i = 0; i < 3; i++) {
+          const surplus = finalDist[i] - floor;
+          if (surplus > 1e-6) {
+            surplusIdx.push(i);
+            surplusTotal += surplus;
+          }
+        }
+        if (surplusTotal > 0) {
+          surplusIdx.forEach((i) => {
+            const share = (finalDist[i] - floor) / surplusTotal;
+            finalDist[i] -= share * added;
+          });
+        }
+      }
+      // Final renormalization
+      const sF = finalDist[0] + finalDist[1] + finalDist[2];
+      finalDist = [finalDist[0] / sF, finalDist[1] / sF, finalDist[2] / sF];
+      // record metrics
+      dozenAdaptiveRef.current.cap = cap;
+      dozenAdaptiveRef.current.floor = floor;
+      if (appliedShrink > 0) dozenAdaptiveRef.current.shrink = appliedShrink;
+    })();
     dozenProbsRef.current = finalDist;
     setDozenVersion((v) => v + 1);
   }, [dozenHistory, buildDozenFeatureWindow, ensureDozenModel, windowSize]);
@@ -2974,5 +3131,6 @@ export function useBinaryModel() {
       decision: dozenDecisionInfoRef.current,
       guard: dozenGuardRef.current,
     },
+    rouletteDozenAdaptive: dozenAdaptiveRef.current,
   };
 }

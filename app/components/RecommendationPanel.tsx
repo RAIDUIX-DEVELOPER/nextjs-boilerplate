@@ -23,6 +23,11 @@ export interface RecommendationPanelProps {
     prob?: number | null;
     correct: boolean | null;
   }[];
+  adaptive?: {
+    cap: number | null;
+    floor: number | null;
+    shrink: number | null;
+  };
   maxLookback?: number;
   className?: string;
 }
@@ -47,6 +52,7 @@ export const RecommendationPanel: React.FC<RecommendationPanelProps> = ({
   mode,
   dozen,
   binary,
+  adaptive,
   maxLookback = 300,
   className = "",
 }) => {
@@ -426,6 +432,21 @@ export const RecommendationPanel: React.FC<RecommendationPanelProps> = ({
           <Metric
             label="Act Dist"
             value={diag.actDist.map((p) => (p * 100).toFixed(0)).join("/")}
+          />
+        )}
+        {mode === "dozens" && adaptive && adaptive.cap != null && (
+          <Metric label="Cap" value={(adaptive.cap * 100).toFixed(1) + "%"} />
+        )}
+        {mode === "dozens" && adaptive && adaptive.floor != null && (
+          <Metric
+            label="Floor"
+            value={(adaptive.floor * 100).toFixed(1) + "%"}
+          />
+        )}
+        {mode === "dozens" && adaptive && adaptive.shrink != null && (
+          <Metric
+            label="Shrink"
+            value={(adaptive.shrink * 100).toFixed(0) + "%"}
           />
         )}
       </div>

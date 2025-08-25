@@ -584,6 +584,7 @@ export default function Home() {
     rouletteDozenAccuracy,
     rouletteDozenVersion,
     controlsVersion,
+    rouletteDozenAdaptive,
   } = useBinaryModel();
   const diagnostics = (() => {
     if (!probParts) return null;
@@ -789,6 +790,7 @@ export default function Home() {
                   probs: r.probs as number[] | null,
                   correct: r.correct,
                 }))}
+                adaptive={rouletteDozenAdaptive}
               />
             </>
           ) : (
