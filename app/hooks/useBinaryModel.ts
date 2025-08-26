@@ -15,6 +15,12 @@ interface ProbParts {
 }
 
 export function useBinaryModel() {
+  // === Persistence Keys / Version ===
+  const PERSIST_VERSION = 1;
+  const PKEY = (k: string) => `rbm_${PERSIST_VERSION}_${k}`; // roulette/binary model namespace
+  const PERSIST_LIMIT = 5000; // max spins to persist per history (raised per requirement)
+  const persistThrottleMs = 2500;
+  const lastPersistRef = useRef<number>(0);
   const windowSize = 24;
   // Expanded feature set: original 8 + avg OVER run length + avg BELOW run length (normalized)
   const featureCount = 10;
@@ -34,6 +40,53 @@ export function useBinaryModel() {
   }
 
   const [records, setRecords] = useState<OutcomeRecord[]>([]);
+
+  // === Base binary model refs (restored shapes) ===
+  const modelRef = useRef<tf.LayersModel | null>(null);
+  const lastPredictionRef = useRef<any>(null); // heterogeneous object across lifecycle
+  const markovCountsRef = useRef<number[][]>([
+    [1, 1],
+    [1, 1],
+  ]); // transition counts prev -> current (below/over)
+  const streakPosteriorsRef = useRef<
+    Record<string, { cont: number; rev: number }>
+  >({});
+  const ewmaRef = useRef<number | null>(null);
+  const probPartsRef = useRef<ProbParts | null>(null);
+  const rlWeightsRef = useRef<{
+    markov: number;
+    streak: number;
+    pattern: number;
+    ewma: number;
+    bayes: number;
+    entropyMod: number;
+    model: number;
+  }>({
+    markov: 1,
+    streak: 1,
+    pattern: 1,
+    ewma: 1,
+    bayes: 1,
+    entropyMod: 1,
+    model: 1,
+  });
+  const accRef = useRef<{ correct: number; total: number }>({
+    correct: 0,
+    total: 0,
+  });
+  // Dozens tracking state we reference later
+  const [dozenRecords, setDozenRecords] = useState<
+    {
+      label: number;
+      predLabel: number | null;
+      probs: [number, number, number];
+      correct: boolean | null;
+    }[]
+  >([]);
+  const [dozenVersion, setDozenVersion] = useState(0);
+  const dozenHiProbMissRateRef = useRef(0);
+  const dozenLastHiProbMissRef = useRef(false);
+  const dozenAbstainRef = useRef(false);
   const [probOver, setProbOver] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [backend, setBackend] = useState<string | null>(null);
@@ -69,7 +122,9 @@ export function useBinaryModel() {
                 await tf.setBackend("webgl");
                 selected = tf.getBackend();
               }
-            } catch {
+            } catch (e) {
+              if (console && console.warn)
+                console.warn("WebGPU init failed, fallback to webgl", e);
               await tf.setBackend("webgl");
               selected = tf.getBackend();
             }
@@ -84,6 +139,7 @@ export function useBinaryModel() {
       }
       setBackend(selected);
       backendReadyRef.current = true;
+      if (console && console.log) console.log("TF backend ready:", selected);
     })();
     await backendInitPromiseRef.current;
   }, [backend]);
@@ -108,74 +164,86 @@ export function useBinaryModel() {
   });
   // Brier auto-shrink escalation state (tracks severity 0 none, 1 mild, 2 pronounced)
   const dozenBrierAutoRef = useRef<{ level: 0 | 1 | 2 }>({ level: 0 });
-  // Heuristic tracking for dozens
-  const dozenMarkovRef = useRef([
-    [1, 1, 1],
-    [1, 1, 1],
-    [1, 1, 1],
-  ]);
+  // Progressive cap decay & shock handling
+  const dozenCapDecayRef = useRef<{ mult: number }>({ mult: 1 });
+  // Track hi-prob prediction outcomes (window) & shock state scaffold
+  const dozenHiProbEventsRef = useRef<number[]>([]); // 1 = miss, 0 = hit for qualifying hi-prob predictions
+  // === New adaptive refs (recency reliability, confusion, opportunity, etc.) ===
+  const dozenReliabilityEwmaRef = useRef<{
+    ema: [number, number, number];
+    total: number;
+  }>({ ema: [1 / 3, 1 / 3, 1 / 3], total: 0 });
+  const dozenReliabilityVarRef = useRef<[number, number, number]>([0, 0, 0]);
+  const dozenConfusionWindowRef = useRef<{ a: number; p: number | null }[]>([]); // last 60 predictions: actual a, predicted p
+  const dozenOpportunityRef = useRef<{
+    topPickCounts: number[];
+    history: number[];
+  }>({ topPickCounts: [0, 0, 0], history: [] });
+  const dozenProbHistoryRef = useRef<[number[], number[], number[]]>([
+    [],
+    [],
+    [],
+  ]); // per-class predicted prob history (last 120)
+  const dozenFalseNegStreakRef = useRef<[number, number, number]>([0, 0, 0]);
+  const dozenPerSourceClassStatsRef = useRef<
+    Record<string, { perClass: { n: number; reward: number }[] }>
+  >({});
+  const dozenGapHazardRef = useRef<{
+    gapSince: [number, number, number];
+    gapAppear: Record<string, number>;
+    gapTotals: Record<string, number>;
+  }>({ gapSince: [0, 0, 0], gapAppear: {}, gapTotals: {} });
+  const dozenAbstainStatsRef = useRef<{
+    qHist: number[];
+    abstains: number;
+    decided: number;
+    wins: number;
+  }>({ qHist: [], abstains: 0, decided: 0, wins: 0 });
+  const dozenPlateauRef = useRef<{
+    last: [number, number, number][];
+    jitterEvents: number;
+  }>({ last: [], jitterEvents: 0 });
+  const dozenShockLevelRef = useRef<number>(0); // escalates 0-3
+  const dozenHiProbMissWindowRef = useRef<boolean[]>([]); // hi-prob misses
   const dozenRunPostRef = useRef<Record<string, { cont: number; rev: number }>>(
     {}
   );
-  const dozenEwmaRef = useRef<[number, number, number] | null>(null);
-  const dozenAccRef = useRef({ correct: 0, total: 0 });
-  interface DozenRecord {
-    label: 0 | 1 | 2;
-    predLabel: 0 | 1 | 2 | null;
-    probs: [number, number, number] | null;
-    correct: boolean | null;
+  const dozenShockRef = useRef<
+    | { active: number }
+    | {
+        active: boolean;
+        ttl: number; // remaining spins in shock
+        hits: number; // hi-prob hits while in shock
+        consec: number; // consecutive hi-prob misses (outside/in shock)
+        severity: number; // last trigger severity 0..1
+      }
+  >({ active: 0 });
+  // Normalize legacy shape to extended structure lazily
+  if (
+    "active" in dozenShockRef.current &&
+    typeof (dozenShockRef.current as any).active === "number"
+  ) {
+    const legacy = dozenShockRef.current as { active: number };
+    if (legacy.active > 0) {
+      dozenShockRef.current = {
+        active: true,
+        ttl: legacy.active,
+        hits: 0,
+        consec: 0,
+        severity: 0,
+      };
+    } else {
+      dozenShockRef.current = {
+        active: false,
+        ttl: 0,
+        hits: 0,
+        consec: 0,
+        severity: 0,
+      };
+    }
   }
-  const [dozenRecords, setDozenRecords] = useState<DozenRecord[]>([]);
-  // Version bump to force UI re-render when dozens prediction/probs update
-  const [dozenVersion, setDozenVersion] = useState(0);
-  // Track last source distributions for dozens to perform accurate RL updates
-  const dozenLastSourcesRef = useRef<Record<
-    string,
-    [number, number, number]
-  > | null>(null);
-  // Per-source performance stats for dozens
-  const dozenSourceStatsRef = useRef<
-    Record<string, { correct: number; total: number }>
-  >({});
-  const modelRef = useRef<tf.LayersModel | null>(null);
-  const markovCountsRef = useRef([
-    [1, 1],
-    [1, 1],
-  ]);
-  const ewmaRef = useRef<number | null>(null);
-  const streakPosteriorsRef = useRef<
-    Record<string, { cont: number; rev: number }>
-  >({});
-  const accRef = useRef({ correct: 0, total: 0 });
-  const probPartsRef = useRef<ProbParts | null>(null);
-  const lastPredictionRef = useRef<{
-    rawProb: number | null;
-    effectiveProb: number | null;
-    invertUsed: boolean;
-    threshold: number;
-  }>({ rawProb: null, effectiveProb: null, invertUsed: false, threshold: 0.5 });
-  const rlWeightsRef = useRef({
-    model: 1,
-    markov: 1,
-    streak: 1,
-    pattern: 1,
-    ewma: 1,
-    bayes: 1,
-    entropyMod: 1,
-  });
-  const [biasInfo, setBiasInfo] = useState<{
-    predRate: number | null;
-    actualRate: number | null;
-    window: number;
-    status: "neutral" | "over-bias" | "under-bias";
-    override: boolean;
-  }>({
-    predRate: null,
-    actualRate: null,
-    window: 0,
-    status: "neutral",
-    override: false,
-  });
+  // Alternation detector
+  const dozenAlternationRef = useRef<{ active: boolean }>({ active: false });
   const biasOverrideRef = useRef(false);
   const biasStableNeutralRef = useRef(0);
   const biasConfigRef = useRef({ window: 20, threshold: 0.3 });
@@ -641,7 +709,6 @@ export function useBinaryModel() {
     if (history.length < 5) {
       lastPredictionRef.current = {
         rawProb: null,
-        effectiveProb: null,
         invertUsed: controlsRef.current.invertStrategy,
         threshold: controlsRef.current.threshold,
       };
@@ -990,8 +1057,9 @@ export function useBinaryModel() {
   // Dozens training loop (multi-class)
   const dozenLastTrainRef = useRef(0);
   // === Aggressive Dozens Tunables ===
-  const DOZEN_TRAIN_START = 5; // earlier start
-  const DOZEN_TRAIN_EVERY = 1; // train every spin once started
+  const DOZEN_TRAIN_START = 25; // start training after 25 spins
+  const DOZEN_TRAIN_EVERY = 2; // train every 2nd spin thereafter
+  const dozenTrainLockRef = useRef(false);
   const DOZEN_MODEL_RAMP_SPINS = 12; // ramp model weight over 12 spins (was 30)
   const DOZEN_INV_FREQ_GAMMA = 0.25; // softer inverse-frequency debias (was 0.4)
   const DOZEN_ENTROPY_FLOOR = 0.7; // relaxed entropy floor (was 0.85)
@@ -1067,6 +1135,66 @@ export function useBinaryModel() {
     Record<string, { tries: number; wins: number }>
   >({});
   const dozenPatternWindowRef = useRef<string[]>([]);
+  // Markov & run-length model refs for dozens
+  const dozenMarkovRef = useRef<number[][]>([
+    [1, 1, 1],
+    [1, 1, 1],
+    [1, 1, 1],
+  ]);
+  const dozenEwmaRef = useRef<[number, number, number] | null>(null);
+  const dozenMarkov2Ref = useRef<number[][][]>([
+    [
+      [1, 1, 1],
+      [1, 1, 1],
+      [1, 1, 1],
+    ],
+    [
+      [1, 1, 1],
+      [1, 1, 1],
+      [1, 1, 1],
+    ],
+    [
+      [1, 1, 1],
+      [1, 1, 1],
+      [1, 1, 1],
+    ],
+  ]);
+  const dozenRunLengthBreakRef = useRef<Record<number, Record<number, number>>>(
+    { 0: {}, 1: {}, 2: {} }
+  );
+  const dozenRunLengthOngoingRef = useRef<Record<number, number>>({});
+  const dozenLastSourcesRef = useRef<Record<string, [number, number, number]>>(
+    {}
+  );
+  const dozenSourceStatsRef = useRef<
+    Record<string, { correct: number; total: number }>
+  >({});
+  const dozenSourceCountsRef = useRef<Record<string, number>>({});
+  const dozenShapePerfRef = useRef<
+    Record<string, { tries: number; wins: number }>
+  >({});
+  const dozenCalibBinsRef = useRef<
+    {
+      low: number;
+      high: number;
+      acc: number;
+      count: number;
+      preds?: number;
+      correct?: number;
+    }[]
+  >([
+    { low: 0, high: 0.2, acc: 0.33, count: 0 },
+    { low: 0.2, high: 0.3, acc: 0.33, count: 0 },
+    { low: 0.3, high: 0.4, acc: 0.33, count: 0 },
+    { low: 0.4, high: 0.5, acc: 0.33, count: 0 },
+    { low: 0.5, high: 0.6, acc: 0.33, count: 0 },
+    { low: 0.6, high: 0.7, acc: 0.33, count: 0 },
+    { low: 0.7, high: 1.01, acc: 0.33, count: 0 },
+  ]);
+  const [biasInfo, setBiasInfo] = useState<{
+    status: "neutral" | "overBias" | "underBias";
+    gap: number;
+  }>({ status: "neutral", gap: 0 });
   function dozenShapeHash(dist: number[]) {
     const bins = dist
       .map((p) => Math.min(19, Math.floor((p * 100) / 5)))
@@ -1111,6 +1239,11 @@ export function useBinaryModel() {
     [0, 0, 0],
     [0, 0, 0],
   ]);
+  // Overall accuracy for dozens mode
+  const dozenAccRef = useRef<{ correct: number; total: number }>({
+    correct: 0,
+    total: 0,
+  });
   // Rolling top-probability vs accuracy window (for overconfidence gap control)
   const dozenTopProbWindowRef = useRef<{ p: number; correct: boolean }[]>([]);
   // Cooldown after catastrophic high-confidence miss
@@ -1307,6 +1440,7 @@ export function useBinaryModel() {
       return;
     }
     if (
+      !dozenTrainLockRef.current &&
       dozenHistory.length >= DOZEN_TRAIN_START &&
       dozenHistory.length % DOZEN_TRAIN_EVERY === 0 &&
       dozenHistory.length !== dozenLastTrainRef.current &&
@@ -1323,16 +1457,39 @@ export function useBinaryModel() {
         ysArr.push(oneHot);
       }
       if (xsArr.length) {
-        const xs = tf.tensor3d(xsArr);
-        const ys = tf.tensor2d(ysArr);
-        await m.fit(xs, ys, {
-          epochs: 1,
-          verbose: 0,
-          batchSize: Math.min(16, xsArr.length),
-        });
-        xs.dispose();
-        ys.dispose();
-        dozenLastTrainRef.current = dozenHistory.length;
+        try {
+          dozenTrainLockRef.current = true;
+          const t0 = performance.now();
+          const xs = tf.tensor3d(xsArr);
+          const ys = tf.tensor2d(ysArr);
+          await m
+            .fit(xs, ys, {
+              epochs: 1,
+              verbose: 0,
+              batchSize: Math.min(16, xsArr.length),
+            })
+            .then(() => {
+              const dt = performance.now() - t0;
+              (dozenAdaptiveRef.current as any).lastTrainMs = dt;
+              (dozenAdaptiveRef.current as any).lastTrainSize = xsArr.length;
+              if (console && console.log)
+                console.log("Dozens model trained", {
+                  spins: dozenHistory.length,
+                  samples: xsArr.length,
+                  ms: +dt.toFixed(1),
+                });
+            })
+            .catch((e) => {
+              (dozenAdaptiveRef.current as any).lastTrainError = String(e);
+              if (console && console.error)
+                console.error("Dozens training error", e);
+            });
+          xs.dispose();
+          ys.dispose();
+          dozenLastTrainRef.current = dozenHistory.length;
+        } finally {
+          dozenTrainLockRef.current = false;
+        }
       }
     }
     const counts = [0, 0, 0];
@@ -1581,22 +1738,45 @@ export function useBinaryModel() {
       longFreq,
       recur: recurDist,
     };
+    // Second-order Markov distribution
+    if (dozenHistory.length >= 2) {
+      const prev1 = dozenHistory[dozenHistory.length - 1];
+      const prev2 = dozenHistory[dozenHistory.length - 2];
+      const row = dozenMarkov2Ref.current[prev2][prev1];
+      const sum = row[0] + row[1] + row[2];
+      sources.markov2 = [row[0] / sum, row[1] / sum, row[2] / sum];
+    }
+    // Hazard source (run-length break probability)
+    if (dozenHistory.length) {
+      const last = dozenHistory[dozenHistory.length - 1];
+      let run = 1;
+      for (let i = dozenHistory.length - 2; i >= 0; i--) {
+        if (dozenHistory[i] === last) run++;
+        else break;
+      }
+      const breaks = dozenRunLengthBreakRef.current[last][run] || 1;
+      const ongoing = dozenRunLengthOngoingRef.current[last] || run;
+      const hazard = breaks / (breaks + ongoing); // probability run breaks now
+      const dist: [number, number, number] = [
+        hazard / 2,
+        hazard / 2,
+        hazard / 2,
+      ];
+      dist[last] = 1 - hazard;
+      sources.hazard = dist;
+    }
     dozenLastSourcesRef.current = sources; // snapshot for RL update
     // Weighting (manual * RL if enabled)
-    const dyn = controlsRef.current.rlEnabled
-      ? rlWeightsRef.current
-      : {
-          model: 1,
-          markov: 1,
-          streak: 1,
-          pattern: 1,
-          ewma: 1,
-          bayes: 1,
-          entropyMod: 1,
-          shortFreq: 1,
-          longFreq: 1,
-          recur: 1,
-        };
+    // UCB weighting across sources
+    const dyn: Record<string, number> = {};
+    const totalSpins = Math.max(1, dozenHistory.length);
+    const c = totalSpins < 150 ? 0.9 : 0.5;
+    Object.keys(sources).forEach((k) => {
+      const stat = dozenSourceStatsRef.current[k];
+      const cnt = dozenSourceCountsRef.current[k] || 1;
+      const mean = stat ? stat.correct / Math.max(1, stat.total) : 0.33;
+      dyn[k] = mean + c * Math.sqrt(Math.log(totalSpins + 1) / cnt);
+    });
     const manual = controlsRef.current;
     // Ramp model weight in gradually to avoid early overfitting dominance
     const n = dozenHistory.length;
@@ -2083,6 +2263,24 @@ export function useBinaryModel() {
         (i) => (1 - blend) * finalDist[i] + blend * (1 / 3)
       ) as [number, number, number];
     }
+    // 3. Hi-prob miss rate exploration boost: if recent hi-prob miss rate high, inject controlled flatten (pre-calibration stage)
+    if (dozenHiProbMissRateRef.current > 0.65) {
+      // Apply a soft temperature (power<1) then mild uniform mix
+      let tDist = finalDist.map((p) => Math.pow(p, 0.9)) as [
+        number,
+        number,
+        number
+      ];
+      const sT = tDist[0] + tDist[1] + tDist[2];
+      tDist = [tDist[0] / sT, tDist[1] / sT, tDist[2] / sT];
+      const uBlend =
+        0.1 + Math.min(0.08, (dozenHiProbMissRateRef.current - 0.65) * 0.25);
+      finalDist = tDist.map((p) => p * (1 - uBlend) + uBlend / 3) as [
+        number,
+        number,
+        number
+      ];
+    }
     // 3. Prediction streak dampening: if same prediction repeats with mediocre realized performance, soften
     const ps = dozenPredStreakRef.current;
     const topIdx =
@@ -2519,6 +2717,180 @@ export function useBinaryModel() {
         finalDist
       );
     })();
+    // Opportunity / bias rebalancing & confusion correction (post reliability shaping, pre alternation detection)
+    (function opportunityBiasConfusion() {
+      if (!finalDist) return;
+      const spins = dozenHistory.length;
+      if (spins < 60) return; // wait for sufficient evidence
+      // Medium window actual share
+      const ACT_WINDOW = 70;
+      const actSlice = dozenHistory.slice(-ACT_WINDOW);
+      if (actSlice.length < 30) return;
+      const actCounts = [0, 0, 0];
+      actSlice.forEach((v) => actCounts[v]++);
+      const actTot = actCounts[0] + actCounts[1] + actCounts[2] || 1;
+      const actShare = actCounts.map((c) => c / actTot) as [
+        number,
+        number,
+        number
+      ];
+      // Predicted share (recent)
+      const PRED_WINDOW = 70;
+      const predSlice = dozenRecentPredsRef.current.slice(-PRED_WINDOW);
+      const predCounts = [0, 0, 0];
+      predSlice.forEach((r) => {
+        if (r.label >= 0 && r.label <= 2) predCounts[r.label] += 1;
+      });
+      const predTot = predCounts[0] + predCounts[1] + predCounts[2] || 1;
+      const predShare = predCounts.map((c) => c / predTot) as [
+        number,
+        number,
+        number
+      ];
+      // Reliability proxy (already computed earlier & exposed) fallback to 1
+      const classPerf = dozenClassPerfRef.current;
+      const rel = [0, 1, 2].map((i) => {
+        const s = classPerf[i];
+        if (s.attempts < 10) return 1;
+        const acc = s.wins / Math.max(1, s.attempts);
+        const meanP = s.sumTopProb / Math.max(1e-6, s.attempts);
+        return Math.max(0.4, Math.min(1.3, acc / Math.max(0.02, meanP)));
+      }) as [number, number, number];
+      // Opportunity uplift: if actual share > predicted share and reliability >=0.95 add small boost
+      let added = [0, 0, 0];
+      for (let i = 0; i < 3; i++) {
+        const gap = actShare[i] - predShare[i];
+        if (gap > 0.04 && rel[i] >= 0.95) {
+          // scale boost by gap & reliability
+          const boost = Math.min(0.04, gap * 0.35 * rel[i]);
+          added[i] = boost;
+          finalDist[i] += boost;
+        }
+      }
+      // Collect total added to subtract proportionally from others above baseline
+      const totalAdded = added[0] + added[1] + added[2];
+      if (totalAdded > 0) {
+        // remove from classes with highest probs
+        const order = [0, 1, 2].sort((a, b) => finalDist[b] - finalDist[a]);
+        let remaining = totalAdded;
+        for (const i of order) {
+          if (remaining <= 1e-6) break;
+          const surplus = Math.max(0, finalDist[i] - 0.3333); // above uniform surrogate
+          if (surplus > 0) {
+            const take = Math.min(surplus, remaining);
+            finalDist[i] -= take;
+            remaining -= take;
+          }
+        }
+      }
+      // High-prob reliability gating: if top prob > 0.5 but reliability <1 clamp
+      const topIdx =
+        finalDist[0] >= finalDist[1] && finalDist[0] >= finalDist[2]
+          ? 0
+          : finalDist[1] >= finalDist[2]
+          ? 1
+          : 2;
+      if (finalDist[topIdx] > 0.5 && rel[topIdx] < 1) {
+        const target = 0.46 + (rel[topIdx] - 0.7) * 0.1; // rel 0.7->0.76, rel 1->0.49
+        const clampTarget = Math.min(finalDist[topIdx], Math.max(0.42, target));
+        if (clampTarget < finalDist[topIdx]) {
+          const diff = finalDist[topIdx] - clampTarget;
+          finalDist[topIdx] = clampTarget;
+          const others = [0, 1, 2].filter((i) => i !== topIdx);
+          finalDist[others[0]] += diff / 2;
+          finalDist[others[1]] += diff / 2;
+        }
+      }
+      // Confusion correction: persistent misclassification from i->j, shift tiny mass when predicting i in favor of j
+      const conf = dozenConfusionRef.current;
+      let confTotal = 0;
+      for (let i = 0; i < 3; i++)
+        for (let j = 0; j < 3; j++) confTotal += conf[i][j];
+      if (confTotal > 150) {
+        // need data
+        for (let i = 0; i < 3; i++) {
+          const rowSum = conf[i][0] + conf[i][1] + conf[i][2] || 1;
+          for (let j = 0; j < 3; j++) {
+            if (i === j) continue;
+            const rate = conf[i][j] / rowSum; // how often actual=j when predicted=i
+            if (rate > 0.5) {
+              // shift small portion of prob(i) toward j
+              const shift = Math.min(0.03, (rate - 0.5) * 0.04);
+              const amt = finalDist[i] * shift;
+              finalDist[i] -= amt;
+              finalDist[j] += amt;
+            }
+          }
+        }
+      }
+      // Renormalize
+      const s = finalDist[0] + finalDist[1] + finalDist[2];
+      if (s > 0) {
+        finalDist = [finalDist[0] / s, finalDist[1] / s, finalDist[2] / s];
+      }
+      // Expose debug
+      (dozenAdaptiveRef.current as any).oppGap = actShare.map(
+        (a, i) => +(a - predShare[i]).toFixed(3)
+      );
+      (dozenAdaptiveRef.current as any).rel = rel;
+    })();
+    // Alternation regime detection (last 6 actual spins include all three & recent win rate low)
+    (function alternationDetect() {
+      if (dozenHistory.length >= 6) {
+        const last6 = dozenHistory.slice(-6);
+        if (new Set(last6).size === 3) {
+          const recs = dozenRecords.slice(-6);
+          const acc =
+            recs.filter((r) => r.correct).length / Math.max(1, recs.length);
+          dozenAlternationRef.current.active = acc < 2 / 6;
+        } else {
+          dozenAlternationRef.current.active = false;
+        }
+      }
+    })();
+    if (dozenAlternationRef.current.active) {
+      finalDist = [0, 1, 2].map((i) => finalDist[i] * 0.6 + 0.4 / 3) as [
+        number,
+        number,
+        number
+      ];
+    }
+    // Pattern ordinal shape damp (low performing shape)
+    (function shapeDamp() {
+      const key = finalDist
+        .map((p, i) => [p, i])
+        .sort((a, b) => b[0] - a[0])
+        .map((x) => x[1])
+        .join("");
+      const perf = dozenShapePerfRef.current[key];
+      if (perf && perf.tries >= 4) {
+        const acc = perf.wins / Math.max(1, perf.tries);
+        if (acc < 0.3) {
+          finalDist = [0, 1, 2].map((i) => finalDist[i] * 0.85 + 0.15 / 3) as [
+            number,
+            number,
+            number
+          ];
+          (dozenAdaptiveRef.current as any).patternDampActive = true;
+        } else (dozenAdaptiveRef.current as any).patternDampActive = false;
+      }
+    })();
+    // Calibration bins remap (pull top prob toward observed)
+    (function calibRemap() {
+      const topIdx =
+        finalDist[0] >= finalDist[1] && finalDist[0] >= finalDist[2]
+          ? 0
+          : finalDist[1] >= finalDist[2]
+          ? 1
+          : 2;
+      const topP = finalDist[topIdx];
+      const bin = dozenCalibBinsRef.current.find(
+        (b) => topP >= b.low && topP < b.high
+      );
+      // Placeholder: advanced bin remap removed until new drift logic integrated
+      (dozenAdaptiveRef.current as any).calibBins =
+        dozenCalibBinsRef.current.map((b) => ({ r: [b.low, b.high] }));
+    })();
     // Adaptive overconfidence clamp based on realized gap history BEFORE decision helper
     (function overconfidenceAdaptive() {
       const w = dozenTopProbWindowRef.current.slice(-50);
@@ -2659,8 +3031,16 @@ export function useBinaryModel() {
       const gap = avgTop - accTop;
       // Derive dynamic cap referencing realized accuracy; tighter if gap large or recent slump.
       let baseCap = accTop > 0 ? accTop + 0.07 : 0.4;
-      if (gap > 0.08) baseCap = accTop + 0.05; // heavy overconfidence – tighter
+      if (gap > 0.08) baseCap = accTop + 0.05;
       else if (gap > 0.05) baseCap = accTop + 0.06;
+      // Apply progressive decay multiplier
+      baseCap *= dozenCapDecayRef.current.mult;
+      // Shock override forces lower cap
+      // Shock cap clamp: support both legacy numeric active and extended object
+      const shock = dozenShockRef.current as any;
+      const shockActive =
+        typeof shock.active === "number" ? shock.active > 0 : !!shock.active;
+      if (shockActive) baseCap = Math.min(baseCap, 0.4);
       // Guardrails
       const nSpins = dozenHistory.length;
       const maxCap = nSpins < 160 ? 0.58 : 0.6; // relax slightly later
@@ -2688,6 +3068,46 @@ export function useBinaryModel() {
         finalDist[others[0]] += excess / 2;
         finalDist[others[1]] += excess / 2;
       }
+      // Micro-shrink on marginal evidence after previous hi-prob miss
+      const sorted = [0, 1, 2]
+        .map((i) => [finalDist[i], i] as [number, number])
+        .sort((a, b) => b[0] - a[0]);
+      const margin = sorted[0][0] - sorted[1][0];
+      if (dozenLastHiProbMissRef.current && margin < 0.035) {
+        for (let i = 0; i < 3; i++) finalDist[i] = finalDist[i] * 0.7 + 0.3 / 3;
+        const sM = finalDist[0] + finalDist[1] + finalDist[2];
+        finalDist = [finalDist[0] / sM, finalDist[1] / sM, finalDist[2] / sM];
+      }
+      // Shock entropy enforcement (~1.05 bits minimum) if shock active
+      const shockObj = dozenShockRef.current as any;
+      if (shockObj && shockObj.active) {
+        const entropy = -finalDist.reduce(
+          (a, p) => a + (p > 0 ? p * Math.log2(p) : 0),
+          0
+        );
+        if (entropy < 1.05) {
+          const need = 1.05 - entropy;
+          const alpha = Math.min(0.35, need * 0.55 + 0.12); // 12%+ depending on deficit
+          for (let i = 0; i < 3; i++)
+            finalDist[i] = finalDist[i] * (1 - alpha) + alpha / 3;
+          const sE = finalDist[0] + finalDist[1] + finalDist[2];
+          finalDist = [finalDist[0] / sE, finalDist[1] / sE, finalDist[2] / sE];
+        }
+      }
+      // Abstain logic (experimental): abstain if margin very low AND hi-prob miss regime active OR shock active
+      const entropyNow = -finalDist.reduce(
+        (a, p) => a + (p > 0 ? p * Math.log2(p) : 0),
+        0
+      );
+      const maxProb = Math.max(...finalDist);
+      const sortedA = [...finalDist].sort((a, b) => b - a);
+      const curMargin = sortedA[0] - sortedA[1];
+      const abstainTrigger =
+        (curMargin < 0.022 &&
+          (dozenHiProbMissRateRef.current > 0.7 ||
+            (shockObj && shockObj.active))) ||
+        (entropyNow > 1.45 && curMargin < 0.015);
+      dozenAbstainRef.current = abstainTrigger;
       // Strengthened Brier-based flatten (synergy with gap): if average Brier over window still > baseline, blend further toward uniform.
       let appliedShrink = 0;
       if (dozenBrierWindowRef.current.length >= DZ_BRIER_WINDOW / 2) {
@@ -2704,32 +3124,127 @@ export function useBinaryModel() {
           }
         }
       }
-      // Probability floor to avoid near-elimination of any class (prevents catastrophic low coverage raising Brier when that class hits)
-      const FLOOR_BASE = 0.055;
-      const floor = gap > 0.06 ? FLOOR_BASE + 0.015 : FLOOR_BASE;
-      let added = 0;
-      for (let i = 0; i < 3; i++) {
-        if (finalDist[i] < floor) {
-          added += floor - finalDist[i];
-          finalDist[i] = floor;
-        }
-      }
-      if (added > 0) {
-        // remove proportionally from over-floor classes
-        let surplusIdx: number[] = [];
-        let surplusTotal = 0;
+      // Dynamic probability floor tied to realized frequencies (rolling window)
+      const FREQ_FLOOR_WINDOW = 30;
+      const freqWindow = dozenHistory.slice(-FREQ_FLOOR_WINDOW);
+      let floor = 0.055;
+      if (freqWindow.length >= 12) {
+        const counts = [0, 0, 0];
+        freqWindow.forEach((v) => (counts[v] += 1));
+        const tot = counts[0] + counts[1] + counts[2] || 1;
+        const shares = counts.map((c) => c / tot);
+        // floor per class = max(0.10, 0.5 * actualShare)
+        // we'll apply a class-specific floor; first gather needed raises
+        const classFloors = shares.map((s) => Math.max(0.1, 0.5 * s));
+        // apply per-class floors
+        let addedDyn = 0;
         for (let i = 0; i < 3; i++) {
-          const surplus = finalDist[i] - floor;
-          if (surplus > 1e-6) {
-            surplusIdx.push(i);
-            surplusTotal += surplus;
+          if (finalDist[i] < classFloors[i]) {
+            addedDyn += classFloors[i] - finalDist[i];
+            finalDist[i] = classFloors[i];
           }
         }
-        if (surplusTotal > 0) {
-          surplusIdx.forEach((i) => {
-            const share = (finalDist[i] - floor) / surplusTotal;
-            finalDist[i] -= share * added;
-          });
+        if (addedDyn > 0) {
+          // remove proportionally from classes above their floor
+          let surplusIdx: number[] = [];
+          let surplusTotal = 0;
+          for (let i = 0; i < 3; i++) {
+            const floorI = classFloors[i];
+            const surplus = finalDist[i] - floorI;
+            if (surplus > 1e-6) {
+              surplusIdx.push(i);
+              surplusTotal += surplus;
+            }
+          }
+          if (surplusTotal > 0) {
+            surplusIdx.forEach((i) => {
+              const floorI = classFloors[i];
+              const share = (finalDist[i] - floorI) / surplusTotal;
+              finalDist[i] -= share * addedDyn;
+            });
+          }
+          const sDf = finalDist[0] + finalDist[1] + finalDist[2];
+          finalDist = [
+            finalDist[0] / sDf,
+            finalDist[1] / sDf,
+            finalDist[2] / sDf,
+          ];
+        }
+        // store average floor used for metrics
+        floor = classFloors.reduce((a, b) => a + b, 0) / 3;
+      } else {
+        // fallback legacy simple floor
+        const FLOOR_BASE = 0.055;
+        floor = gap > 0.06 ? FLOOR_BASE + 0.015 : FLOOR_BASE;
+        let added2 = 0;
+        for (let i = 0; i < 3; i++)
+          if (finalDist[i] < floor) {
+            added2 += floor - finalDist[i];
+            finalDist[i] = floor;
+          }
+        if (added2 > 0) {
+          let surplusIdx2: number[] = [];
+          let surplusTotal2 = 0;
+          for (let i = 0; i < 3; i++) {
+            const surplus = finalDist[i] - floor;
+            if (surplus > 1e-6) {
+              surplusIdx2.push(i);
+              surplusTotal2 += surplus;
+            }
+          }
+          if (surplusTotal2 > 0) {
+            surplusIdx2.forEach((i) => {
+              const share = (finalDist[i] - floor) / surplusTotal2;
+              finalDist[i] -= share * added2;
+            });
+          }
+          const sF2 = finalDist[0] + finalDist[1] + finalDist[2];
+          finalDist = [
+            finalDist[0] / sF2,
+            finalDist[1] / sF2,
+            finalDist[2] / sF2,
+          ];
+        }
+      }
+      // Ensure predicted share coverage: predicted probability each class >= 60% of its realized rolling share after sufficient spins
+      if (dozenHistory.length >= 40) {
+        const coverWindow = dozenHistory.slice(-FREQ_FLOOR_WINDOW);
+        if (coverWindow.length >= 15) {
+          const cCounts = [0, 0, 0];
+          coverWindow.forEach((v) => (cCounts[v] += 1));
+          const ct = cCounts[0] + cCounts[1] + cCounts[2] || 1;
+          const cShares = cCounts.map((c) => c / ct);
+          let adjAdded = 0;
+          const minCov: number[] = cShares.map((s) => 0.6 * s);
+          for (let i = 0; i < 3; i++) {
+            if (finalDist[i] < minCov[i]) {
+              adjAdded += minCov[i] - finalDist[i];
+              finalDist[i] = minCov[i];
+            }
+          }
+          if (adjAdded > 0) {
+            // remove proportionally from classes above minCov
+            let idxs: number[] = [];
+            let totalSur = 0;
+            for (let i = 0; i < 3; i++) {
+              const sur = finalDist[i] - minCov[i];
+              if (sur > 1e-6) {
+                idxs.push(i);
+                totalSur += sur;
+              }
+            }
+            if (totalSur > 0)
+              idxs.forEach((i) => {
+                const share = (finalDist[i] - minCov[i]) / totalSur;
+                finalDist[i] -= share * adjAdded;
+              });
+            const sCv = finalDist[0] + finalDist[1] + finalDist[2];
+            finalDist = [
+              finalDist[0] / sCv,
+              finalDist[1] / sCv,
+              finalDist[2] / sCv,
+            ];
+          }
         }
       }
       // Final renormalization
@@ -2982,14 +3497,14 @@ export function useBinaryModel() {
             : null;
           let status: typeof biasInfo.status = "neutral";
           if (predRate != null) {
-            if (predRate > actualRate + cfg.threshold) status = "over-bias";
+            if (predRate > actualRate + cfg.threshold) status = "overBias";
             else if (predRate < actualRate - cfg.threshold)
-              status = "under-bias";
+              status = "underBias";
           }
           if (status === "neutral") biasStableNeutralRef.current += 1;
           else biasStableNeutralRef.current = 0;
           if (
-            (status === "over-bias" || status === "under-bias") &&
+            (status === "overBias" || status === "underBias") &&
             !biasOverrideRef.current
           )
             biasOverrideRef.current = true;
@@ -3000,11 +3515,8 @@ export function useBinaryModel() {
           )
             biasOverrideRef.current = false;
           setBiasInfo({
-            predRate,
-            actualRate,
-            window: w,
             status,
-            override: biasOverrideRef.current,
+            gap: +(predRate != null ? predRate - actualRate : 0).toFixed(3),
           });
         }
         controlsRef.current.threshold = 0.5;
@@ -3043,13 +3555,98 @@ export function useBinaryModel() {
   useEffect(() => {
     (async () => {
       await ensureBackend();
+      // One-time load persisted state (histories & models)
+      if (!backendReadyRef.current) return;
+      try {
+        // Histories
+        if (history.length === 0) {
+          const h = localStorage.getItem(PKEY("bin_history"));
+          if (h) {
+            const arr = JSON.parse(h);
+            if (Array.isArray(arr) && arr.every((x) => x === 0 || x === 1)) {
+              setHistory(arr.slice(-PERSIST_LIMIT));
+            }
+          }
+          const recs = localStorage.getItem(PKEY("bin_records"));
+          if (recs) {
+            const r = JSON.parse(recs);
+            if (Array.isArray(r)) setRecords(r.slice(-PERSIST_LIMIT));
+          }
+        }
+        if (dozenHistory.length === 0) {
+          const dh = localStorage.getItem(PKEY("dz_history"));
+          if (dh) {
+            const arr = JSON.parse(dh);
+            if (
+              Array.isArray(arr) &&
+              arr.every((x) => x === 0 || x === 1 || x === 2)
+            ) {
+              setDozenHistory(arr.slice(-PERSIST_LIMIT));
+            }
+          }
+          const dr = localStorage.getItem(PKEY("dz_records"));
+          if (dr) {
+            const r = JSON.parse(dr);
+            if (Array.isArray(r)) setDozenRecords(r.slice(-PERSIST_LIMIT));
+          }
+          // Adaptive state (subset)
+          const dstate = localStorage.getItem(PKEY("dz_state"));
+          if (dstate) {
+            const ds = JSON.parse(dstate);
+            if (ds && ds.rel && Array.isArray(ds.rel.predSum)) {
+              dozenReliabilityRef.current.predSum = ds.rel.predSum;
+              dozenReliabilityRef.current.actual = ds.rel.actual;
+            }
+            if (ds && ds.calib && Array.isArray(ds.calib.mult)) {
+              dozenCalibAdjRef.current.mult = ds.calib.mult;
+              if (typeof ds.calib.temp === "number")
+                dozenCalibAdjRef.current.temp = ds.calib.temp;
+            }
+          }
+        }
+        // Load models (ignore errors)
+        if (!modelRef.current) {
+          try {
+            const loaded = await tf.loadLayersModel(
+              `localstorage://${PKEY("bin_model")}`
+            );
+            modelRef.current = loaded;
+          } catch {}
+        }
+        if (!dozenModelRef.current) {
+          try {
+            const loadedDz = await tf.loadLayersModel(
+              `localstorage://${PKEY("dz_model")}`
+            );
+            dozenModelRef.current = loadedDz;
+          } catch {}
+        }
+      } catch (e) {
+        if (console && console.warn) console.warn("Persist load failed", e);
+      }
       if (history.length) {
         setLoading(true);
         await trainAndPredict();
         setLoading(false);
       }
     })();
-  }, [history, trainAndPredict, ensureBackend]);
+  }, [history, trainAndPredict, ensureBackend, dozenHistory.length]);
+
+  // Reliability warm-start (pseudo counts) – apply once on mount for dozens calibration if untouched
+  useEffect(() => {
+    if (
+      !dozenHistory.length &&
+      dozenReliabilityRef.current.predSum.every((v) => v === 0)
+    ) {
+      // Seed with mild pseudo evidence (Dirichlet-like) to avoid early extreme temp swings
+      const seed = 2; // equivalent to 6 pseudo outcomes total
+      const seedVal = seed / 3;
+      dozenReliabilityRef.current.predSum = [seedVal, seedVal, seedVal];
+      dozenReliabilityRef.current.actual = [seedVal, seedVal, seedVal];
+      // Also give calibration multipliers a soft start near 1
+      for (let i = 0; i < 3; i++) dozenCalibAdjRef.current.mult[i] = 1;
+    }
+  }, []);
 
   return {
     addObservation,
@@ -3094,7 +3691,7 @@ export function useBinaryModel() {
           correct,
         },
       ]);
-      // === Calibration / Reliability / Brier tracking ===
+      // === Calibration / Reliability / Brier tracking (legacy base) ===
       if (snapshotProbs) {
         // Brier score update (multi-class)
         const y = [0, 0, 0];
@@ -3185,17 +3782,197 @@ export function useBinaryModel() {
               0.7 * dozenCalibAdjRef.current.temp + 0.3 * targetTemp;
           }
         }
-        // Catastrophic high-prob miss triggers cooldown
-        if (!correct) {
-          const topP = Math.max(...snapshotProbs);
-          if (topP >= 0.6) {
-            // escalate flattening proportional to top probability
-            const severity = Math.min(1, (topP - 0.6) / 0.2); // 0..1 for 0.6..0.8
+        // Hi-prob event tracking + cooldown/shock triggers
+        const topNow = Math.max(...snapshotProbs);
+        if (topNow >= 0.55) {
+          // Qualifying hi-prob event (slightly lower threshold than catastrophic cooldown)
+          if (!correct) {
+            dozenHiProbEventsRef.current.push(1);
+          } else {
+            dozenHiProbEventsRef.current.push(0);
+          }
+          if (dozenHiProbEventsRef.current.length > 120) {
+            dozenHiProbEventsRef.current.splice(
+              0,
+              dozenHiProbEventsRef.current.length - 120
+            );
+          }
+          // Update miss rate over last 30 qualifying events
+          if (dozenHiProbEventsRef.current.length >= 8) {
+            const slice = dozenHiProbEventsRef.current.slice(-30);
+            const missRate = slice.reduce((a, b) => a + b, 0) / slice.length;
+            dozenHiProbMissRateRef.current = missRate;
+          }
+          // Track last hi-prob miss flag
+          if (!correct && topNow >= 0.6) {
+            dozenLastHiProbMissRef.current = true;
+          } else if (correct && topNow >= 0.6) {
+            dozenLastHiProbMissRef.current = false;
+          }
+          // Cooldown on catastrophic high-prob miss >=0.6
+          if (!correct && topNow >= 0.6) {
+            const severity = Math.min(1, (topNow - 0.6) / 0.25); // widen range a bit to 0.85
             dozenHiProbCooldownRef.current = {
-              spins: 4 + Math.round(severity * 4), // 4-8 spins
-              factor: 1.2 + severity * 0.5, // flatten factor 1.2 - 1.7
+              spins: 4 + Math.round(severity * 5), // 4-9 spins
+              factor: 1.2 + severity * 0.6, // 1.2 - 1.8
             };
           }
+          // === Persistence (throttled) ===
+          const now = Date.now();
+          if (now - lastPersistRef.current > persistThrottleMs) {
+            lastPersistRef.current = now;
+            try {
+              // histories & records
+              localStorage.setItem(
+                PKEY("dz_history"),
+                JSON.stringify(dozenHistory.slice(-PERSIST_LIMIT))
+              );
+              localStorage.setItem(
+                PKEY("dz_records"),
+                JSON.stringify(dozenRecords.slice(-PERSIST_LIMIT))
+              );
+              localStorage.setItem(
+                PKEY("bin_history"),
+                JSON.stringify(history.slice(-PERSIST_LIMIT))
+              );
+              localStorage.setItem(
+                PKEY("bin_records"),
+                JSON.stringify(records.slice(-PERSIST_LIMIT))
+              );
+              // adaptive state snapshot
+              localStorage.setItem(
+                PKEY("dz_state"),
+                JSON.stringify({
+                  rel: dozenReliabilityRef.current,
+                  calib: dozenCalibAdjRef.current,
+                })
+              );
+              // save models (async, fire & forget)
+              if (modelRef.current)
+                modelRef.current
+                  .save(`localstorage://${PKEY("bin_model")}`)
+                  .catch(() => {});
+              if (dozenModelRef.current)
+                dozenModelRef.current
+                  .save(`localstorage://${PKEY("dz_model")}`)
+                  .catch(() => {});
+            } catch (e) {
+              if (console && console.warn)
+                console.warn("Persist save failed", e);
+            }
+          }
+          // Shock activation: three hi-prob misses (>=0.6) within last 12 qualifying events OR miss rate >0.65 over last 20
+          const shock = dozenShockRef.current as any;
+          const recentQual = dozenHiProbEventsRef.current.slice(-20);
+          const severeSlice = dozenHiProbEventsRef.current
+            .map((m, i) => ({ m, i }))
+            .filter(({ i }) => i >= dozenHiProbEventsRef.current.length - 40) // consider last 40 for severity cluster
+            .map((o) => o.m);
+          const last12 = dozenHiProbEventsRef.current.slice(-12);
+          const severeMisses = last12.reduce(
+            (a, b) => a + (b === 1 ? 1 : 0),
+            0
+          );
+          const missRate20 =
+            recentQual.slice(-20).reduce((a, b) => a + b, 0) /
+            (recentQual.slice(-20).length || 1);
+          if (!shock.active) {
+            if (severeMisses >= 3 || missRate20 > 0.65) {
+              const sev = Math.min(
+                1,
+                severeMisses / 5 +
+                  (missRate20 > 0.65 ? (missRate20 - 0.65) * 2 : 0)
+              );
+              dozenShockRef.current = {
+                active: true,
+                ttl: 8 + Math.round(sev * 8), // 8-16 spins
+                hits: 0,
+                consec: 0,
+                severity: sev,
+              };
+              // Progressive cap decay multiplier downward nudge on activation
+              dozenCapDecayRef.current.mult = Math.max(
+                0.6,
+                dozenCapDecayRef.current.mult * (0.92 - 0.1 * sev)
+              );
+            }
+          } else if (shock.active) {
+            // While in shock, decrement ttl and enforce entropy later; collect hits
+            if (correct) (dozenShockRef.current as any).hits += 1;
+            (dozenShockRef.current as any).ttl -= 1;
+            if ((dozenShockRef.current as any).ttl <= 0) {
+              // Recover: ease cap decay toward 1
+              dozenCapDecayRef.current.mult = Math.min(
+                1,
+                dozenCapDecayRef.current.mult * 1.05
+              );
+              dozenShockRef.current = {
+                active: false,
+                ttl: 0,
+                hits: 0,
+                consec: 0,
+                severity: 0,
+              };
+            }
+          }
+        }
+        // === New: probability history & EWMA reliability ===
+        for (let i = 0; i < 3; i++) {
+          dozenProbHistoryRef.current[i].push(snapshotProbs[i]);
+          if (dozenProbHistoryRef.current[i].length > 120)
+            dozenProbHistoryRef.current[i].splice(
+              0,
+              dozenProbHistoryRef.current[i].length - 120
+            );
+        }
+        const ema = dozenReliabilityEwmaRef.current.ema;
+        const alphaE = 0.15;
+        for (let i = 0; i < 3; i++) {
+          const outcome = d === i ? 1 : 0;
+          const err = outcome - snapshotProbs[i];
+          // small step toward reducing bias: scaled error half strength
+          ema[i] = ema[i] + alphaE * err * 0.5;
+        }
+        dozenReliabilityEwmaRef.current.total += 1;
+        // Directional confusion window (actual vs predicted label)
+        dozenConfusionWindowRef.current.push({ a: d, p: snapshotLabel });
+        if (dozenConfusionWindowRef.current.length > 60)
+          dozenConfusionWindowRef.current.splice(
+            0,
+            dozenConfusionWindowRef.current.length - 60
+          );
+        // Opportunity tracking (how often each class is top pick)
+        if (snapshotLabel != null)
+          dozenOpportunityRef.current.topPickCounts[snapshotLabel] += 1;
+        dozenOpportunityRef.current.history.push(d);
+        if (dozenOpportunityRef.current.history.length > 400)
+          dozenOpportunityRef.current.history.shift();
+        // False-negative streaks (pred not chosen but actual)
+        for (let i = 0; i < 3; i++) {
+          if (d === i && snapshotLabel !== i)
+            dozenFalseNegStreakRef.current[i] += 1;
+          else if (d === i && snapshotLabel === i)
+            dozenFalseNegStreakRef.current[i] = 0;
+        }
+        // Gap hazard tracking: time since last appearance of each class
+        const gh = dozenGapHazardRef.current;
+        for (let i = 0; i < 3; i++) gh.gapSince[i] += 1;
+        gh.gapSince[d] = 0;
+        // appearance gap length for class d
+        let gapLen = 0;
+        for (
+          let i = dozenOpportunityRef.current.history.length - 2;
+          i >= 0;
+          i--
+        ) {
+          if (dozenOpportunityRef.current.history[i] === d) break;
+          gapLen++;
+        }
+        const appearKey = `${d}:${gapLen}`;
+        gh.gapAppear[appearKey] = (gh.gapAppear[appearKey] || 0) + 1;
+        for (let L = 0; L <= gapLen; L++) {
+          const totKey = `${d}:>=${L}`;
+          gh.gapTotals[totKey] = (gh.gapTotals[totKey] || 0) + 1;
         }
       }
       // Track per-class stats (prediction correctness by predicted class)
@@ -3377,8 +4154,8 @@ export function useBinaryModel() {
     backend,
     ready: history.length > windowSize,
     windowSize,
-    accuracy: accRef.current.total
-      ? accRef.current.correct / accRef.current.total
+    accuracy: dozenAccRef.current.total
+      ? dozenAccRef.current.correct / dozenAccRef.current.total
       : null,
     controls: controlsRef.current,
     controlsVersion,
@@ -3445,5 +4222,13 @@ export function useBinaryModel() {
       guard: dozenGuardRef.current,
     },
     rouletteDozenAdaptive: dozenAdaptiveRef.current,
+    rouletteDozenExtended: {
+      hiProbMissRate: dozenHiProbMissRateRef.current,
+      lastHiProbMiss: dozenLastHiProbMissRef.current,
+      capDecayMult: dozenCapDecayRef.current.mult,
+      shock: dozenShockRef.current,
+      alternation: dozenAlternationRef.current,
+      abstain: dozenAbstainRef.current,
+    },
   };
 }

@@ -28,6 +28,14 @@ export interface RecommendationPanelProps {
     floor: number | null;
     shrink: number | null;
   };
+  extended?: {
+    hiProbMissRate?: number;
+    lastHiProbMiss?: boolean;
+    capDecayMult?: number;
+    shock?: any;
+    alternation?: any;
+    abstain?: boolean;
+  };
   maxLookback?: number;
   className?: string;
 }
@@ -53,6 +61,7 @@ export const RecommendationPanel: React.FC<RecommendationPanelProps> = ({
   dozen,
   binary,
   adaptive,
+  extended,
   maxLookback = 300,
   className = "",
 }) => {
@@ -448,6 +457,37 @@ export const RecommendationPanel: React.FC<RecommendationPanelProps> = ({
             label="Shrink"
             value={(adaptive.shrink * 100).toFixed(0) + "%"}
           />
+        )}
+        {mode === "dozens" && extended?.hiProbMissRate != null && (
+          <Metric
+            label="HiMiss%"
+            value={((extended.hiProbMissRate || 0) * 100).toFixed(0) + "%"}
+          />
+        )}
+        {mode === "dozens" && extended?.capDecayMult != null && (
+          <Metric
+            label="CapDec"
+            value={(extended.capDecayMult as number).toFixed(2)}
+          />
+        )}
+        {mode === "dozens" && extended?.shock && (
+          <Metric
+            label="Shock"
+            value={
+              extended.shock.active ? `ON:${extended.shock.ttl || 0}` : "off"
+            }
+          />
+        )}
+        {mode === "dozens" && extended?.alternation && (
+          <Metric
+            label="Alt"
+            value={
+              extended.alternation.active ? extended.alternation.spins : "-"
+            }
+          />
+        )}
+        {mode === "dozens" && extended?.abstain != null && (
+          <Metric label="Abstain" value={extended.abstain ? "Yes" : "No"} />
         )}
       </div>
       <ul className="space-y-2">
