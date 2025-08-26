@@ -290,6 +290,10 @@ export function useBinaryModel() {
     sumBelowRuns: 0,
     countBelowRuns: 0,
   });
+  const metricsRef = useRef(metrics);
+  useEffect(() => {
+    metricsRef.current = metrics;
+  }, [metrics]);
 
   // === Bias / Regime Detection Config ===
   const BIAS_WINDOW = 40; // window for bias & run-length regime detection
@@ -3758,6 +3762,61 @@ export function useBinaryModel() {
             }
           }
         }
+        // Comprehensive full-state snapshot (new)
+        try {
+          const fsRaw = localStorage.getItem(PKEY("fullstate"));
+          if (fsRaw) {
+            const fs = JSON.parse(fsRaw);
+            if (fs && fs.v === 1) {
+              if (Array.isArray(fs.history) && !history.length)
+                setHistory(fs.history.slice(-PERSIST_LIMIT));
+              if (Array.isArray(fs.records) && !records.length)
+                setRecords(fs.records.slice(-PERSIST_LIMIT));
+              if (Array.isArray(fs.dozenHistory) && !dozenHistory.length)
+                setDozenHistory(fs.dozenHistory.slice(-PERSIST_LIMIT));
+              if (Array.isArray(fs.dozenRecords) && !dozenRecords.length)
+                setDozenRecords(fs.dozenRecords.slice(-PERSIST_LIMIT));
+              if (fs.controls && typeof fs.controls === "object") {
+                // shallow merge to preserve new defaults
+                controlsRef.current = {
+                  ...controlsRef.current,
+                  ...fs.controls,
+                };
+                setControls(fs.controls);
+              }
+              if (fs.rlWeights) {
+                rlWeightsRef.current = {
+                  ...rlWeightsRef.current,
+                  ...fs.rlWeights,
+                };
+              }
+              if (fs.lastPrediction)
+                lastPredictionRef.current = fs.lastPrediction;
+              if (fs.dozenPrediction)
+                dozenPredictionRef.current = fs.dozenPrediction;
+              if (fs.dozenReliability?.predSum) {
+                dozenReliabilityRef.current.predSum =
+                  fs.dozenReliability.predSum;
+                if (fs.dozenReliability.actual)
+                  dozenReliabilityRef.current.actual =
+                    fs.dozenReliability.actual;
+              }
+              if (fs.dozenCalib?.mult) {
+                dozenCalibAdjRef.current.mult = fs.dozenCalib.mult;
+                if (typeof fs.dozenCalib.temp === "number")
+                  dozenCalibAdjRef.current.temp = fs.dozenCalib.temp;
+              }
+              if (fs.biasInfo && typeof fs.biasInfo.status === "string") {
+                setBiasInfo(fs.biasInfo);
+              }
+              if (fs.metrics) {
+                try {
+                  setMetrics((m) => ({ ...m, ...fs.metrics }));
+                } catch {}
+              }
+            }
+          }
+        } catch {}
         // Remote pull (after local) – only if we still have little local data or remote may be longer
         if (
           (!history.length || !dozenHistory.length) &&
@@ -4008,6 +4067,29 @@ export function useBinaryModel() {
                   calib: dozenCalibAdjRef.current,
                 })
               );
+              // full comprehensive snapshot
+              const fullSnapshot = {
+                v: 1,
+                ts: Date.now(),
+                history: history.slice(-PERSIST_LIMIT),
+                records: records.slice(-PERSIST_LIMIT),
+                dozenHistory: dozenHistory.slice(-PERSIST_LIMIT),
+                dozenRecords: dozenRecords.slice(-PERSIST_LIMIT),
+                controls: controlsRef.current,
+                rlWeights: rlWeightsRef.current,
+                lastPrediction: lastPredictionRef.current,
+                dozenPrediction: dozenPredictionRef.current,
+                dozenReliability: dozenReliabilityRef.current,
+                dozenCalib: dozenCalibAdjRef.current,
+                biasInfo,
+                metrics: metricsRef.current,
+              };
+              try {
+                localStorage.setItem(
+                  PKEY("fullstate"),
+                  JSON.stringify(fullSnapshot)
+                );
+              } catch {}
               // save models (async, fire & forget)
               if (modelRef.current)
                 modelRef.current
