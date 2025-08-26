@@ -90,6 +90,13 @@ export function useBinaryModel() {
   const [probOver, setProbOver] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [backend, setBackend] = useState<string | null>(null);
+  // Remote persistence (Edge Config via /api/state) control refs & helpers (placed after state declarations)
+  const remoteStateRef = useRef<{
+    status: "idle" | "loading" | "ready" | "error";
+    lastPull?: number;
+    lastPush?: number;
+    error?: string;
+  }>({ status: "idle" });
   // Backend readiness control to prevent model building before backend initialized
   const backendReadyRef = useRef(false);
   const backendInitPromiseRef = useRef<Promise<void> | null>(null);
@@ -1091,6 +1098,8 @@ export function useBinaryModel() {
     last: number | null;
     incorrect: number;
   }>({ last: null, incorrect: 0 });
+  // Auto-rotation cooldown (spins remaining before another forced rotation allowed)
+  const dozenRotateCooldownRef = useRef<number>(0);
   const dozenPredFreqRef = useRef<[number, number, number]>([0, 0, 0]);
   // Track per-class prediction accuracy and model-only accuracy for gating
   const dozenClassStatsRef = useRef<
@@ -1284,6 +1293,95 @@ export function useBinaryModel() {
   const DZ_EARLY_HICONF_CLAMP_BASE = 0.52; // initial clamp start
   const DZ_HICONF_CLAMP_MIN = 0.48; // adaptive lower bound
 
+  // --- Remote persistence helpers (Edge Config via /api/state) ---
+  const remoteAttemptRef = useRef(false);
+  const pendingRemotePushRef = useRef(false);
+  const pullRemoteOnce = useCallback(async () => {
+    if (remoteAttemptRef.current) return;
+    remoteAttemptRef.current = true;
+    remoteStateRef.current.status = "loading";
+    try {
+      const res = await fetch("/api/state", { cache: "no-store" });
+      if (!res.ok) throw new Error("remote fetch failed " + res.status);
+      const data = await res.json();
+      const safeArr = (v: any, pred: (x: any) => boolean) =>
+        Array.isArray(v) && v.every(pred) ? v : null;
+      if (data.bin_history) {
+        const arr = safeArr(data.bin_history, (x) => x === 0 || x === 1);
+        if (arr && arr.length && arr.length > history.length)
+          setHistory(arr.slice(-PERSIST_LIMIT));
+      }
+      if (data.bin_records) {
+        const arr = safeArr(data.bin_records, (r) => typeof r === "object");
+        if (arr && arr.length && arr.length > records.length)
+          setRecords(arr.slice(-PERSIST_LIMIT));
+      }
+      if (data.dz_history) {
+        const arr = safeArr(
+          data.dz_history,
+          (x) => x === 0 || x === 1 || x === 2
+        );
+        if (arr && arr.length && arr.length > dozenHistory.length)
+          setDozenHistory(arr.slice(-PERSIST_LIMIT));
+      }
+      if (data.dz_records) {
+        const arr = safeArr(data.dz_records, (r) => typeof r === "object");
+        if (arr && arr.length && arr.length > dozenRecords.length)
+          setDozenRecords(arr.slice(-PERSIST_LIMIT));
+      }
+      if (data.dz_state) {
+        const ds = data.dz_state;
+        if (ds?.rel?.predSum && Array.isArray(ds.rel.predSum)) {
+          dozenReliabilityRef.current.predSum = ds.rel.predSum;
+          dozenReliabilityRef.current.actual = ds.rel.actual || [0, 0, 0];
+        }
+        if (ds?.calib?.mult && Array.isArray(ds.calib.mult)) {
+          dozenCalibAdjRef.current.mult = ds.calib.mult;
+          if (typeof ds.calib.temp === "number")
+            dozenCalibAdjRef.current.temp = ds.calib.temp;
+        }
+      }
+      remoteStateRef.current.status = "ready";
+      remoteStateRef.current.lastPull = Date.now();
+    } catch (err: any) {
+      remoteStateRef.current.status = "error";
+      remoteStateRef.current.error = err?.message || "remote pull failed";
+    }
+  }, [
+    history.length,
+    records.length,
+    dozenHistory.length,
+    dozenRecords.length,
+  ]);
+  const pushRemote = useCallback(async () => {
+    if (pendingRemotePushRef.current) return;
+    pendingRemotePushRef.current = true;
+    try {
+      const payload = {
+        bin_history: history.slice(-PERSIST_LIMIT),
+        bin_records: records.slice(-PERSIST_LIMIT),
+        dz_history: dozenHistory.slice(-PERSIST_LIMIT),
+        dz_records: dozenRecords.slice(-PERSIST_LIMIT),
+        dz_state: {
+          rel: dozenReliabilityRef.current,
+          calib: dozenCalibAdjRef.current,
+        },
+      };
+      await fetch("/api/state", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        keepalive: true,
+      });
+      remoteStateRef.current.lastPush = Date.now();
+      if (remoteStateRef.current.status === "idle")
+        remoteStateRef.current.status = "ready";
+    } catch {
+    } finally {
+      pendingRemotePushRef.current = false;
+    }
+  }, [history, records, dozenHistory, dozenRecords]);
+
   // === DOZENS DECISION HELPERS ===
   const sampleDirichlet = (
     v: [number, number, number]
@@ -1430,6 +1528,8 @@ export function useBinaryModel() {
   const trainAndPredictDozens = useCallback(async () => {
     if (!backendReadyRef.current) await ensureBackend();
     if (!backendReadyRef.current) return; // still not ready
+    // decrement rotation cooldown
+    if (dozenRotateCooldownRef.current > 0) dozenRotateCooldownRef.current -= 1;
     const m = await ensureDozenModel();
     // If insufficient history for a window, still output a uniform distribution so UI has stable values.
     if (dozenHistory.length === 0) {
@@ -3018,6 +3118,60 @@ export function useBinaryModel() {
     } else {
       dozenPredictionRef.current = { probs: finalDist, predLabel: pred };
     }
+    // --- AUTO SECONDARY ROTATION (pre final safety clamp) ---
+    (function autoSecondaryRotate() {
+      if (!finalDist) return;
+      // Only consider if cooldown expired
+      if (dozenRotateCooldownRef.current > 0) return;
+      const es = dozenPredErrorStreakRef.current; // streak up to previous outcome
+      const currentPred = dozenPredictionRef.current.predLabel;
+      if (currentPred == null) return;
+      // Require at least 2 prior consecutive misses on this predicted class
+      if (es.last === currentPred && es.incorrect >= 2) {
+        // Evaluate margin
+        const ordered = [0, 1, 2]
+          .map((i) => ({ i, p: finalDist[i] }))
+          .sort((a, b) => b.p - a.p);
+        const top = ordered[0];
+        const second = ordered[1];
+        const margin = top.p - second.p;
+        const MARGIN_MAX = 0.09; // only rotate if advantage small
+        if (margin < MARGIN_MAX) {
+          // Simple reliability heuristic for each class (wins/attempts)
+          const perfTop = dozenClassPerfRef.current[top.i];
+          const perfSecond = dozenClassPerfRef.current[second.i];
+          const accTop = perfTop.attempts
+            ? perfTop.wins / perfTop.attempts
+            : 0.34;
+          const accSecond = perfSecond.attempts
+            ? perfSecond.wins / perfSecond.attempts
+            : 0.34;
+          // Rotate if second not worse and either (a) second accuracy >= topAcc - 0.03 OR (b) second accuracy substantially better
+          if (accSecond >= accTop - 0.03 || accSecond > accTop + 0.04) {
+            // Transfer enough mass to invert ranking plus small epsilon
+            const need = margin + 0.002;
+            const transfer = Math.min(need, top.p * 0.6); // don't over-shift
+            finalDist[top.i] -= transfer;
+            finalDist[second.i] += transfer;
+            // renormalize
+            const s = finalDist[0] + finalDist[1] + finalDist[2];
+            finalDist = [finalDist[0] / s, finalDist[1] / s, finalDist[2] / s];
+            dozenPredictionRef.current = {
+              probs: finalDist as [number, number, number],
+              predLabel: second.i as 0 | 1 | 2,
+            };
+            (dozenAdaptiveRef.current as any).rotated = {
+              from: top.i,
+              to: second.i,
+              margin: +margin.toFixed(3),
+              accTop: +accTop.toFixed(3),
+              accSecond: +accSecond.toFixed(3),
+            };
+            dozenRotateCooldownRef.current = 3; // cooldown several spins
+          }
+        }
+      }
+    })();
     // --- FINAL POST-CHOICE SAFETY CLAMP & BRIER SYNERGY FLATTEN ---
     (function finalSafety() {
       // Stronger global cap applied AFTER chooseDozen and all shaping, so later steps cannot re-sharpen unchecked.
@@ -3604,6 +3758,13 @@ export function useBinaryModel() {
             }
           }
         }
+        // Remote pull (after local) – only if we still have little local data or remote may be longer
+        if (
+          (!history.length || !dozenHistory.length) &&
+          remoteStateRef.current.status === "idle"
+        ) {
+          pullRemoteOnce();
+        }
         // Load models (ignore errors)
         if (!modelRef.current) {
           try {
@@ -3856,6 +4017,8 @@ export function useBinaryModel() {
                 dozenModelRef.current
                   .save(`localstorage://${PKEY("dz_model")}`)
                   .catch(() => {});
+              // Remote push (fire & forget)
+              pushRemote();
             } catch (e) {
               if (console && console.warn)
                 console.warn("Persist save failed", e);
@@ -4230,5 +4393,6 @@ export function useBinaryModel() {
       alternation: dozenAlternationRef.current,
       abstain: dozenAbstainRef.current,
     },
+    remoteState: remoteStateRef.current,
   };
 }
