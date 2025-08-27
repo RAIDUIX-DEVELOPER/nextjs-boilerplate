@@ -20,6 +20,11 @@ export function useBinaryModel() {
   const PKEY = (k: string) => `rbm_${PERSIST_VERSION}_${k}`; // roulette/binary model namespace
   const PERSIST_LIMIT = 5000; // max spins to persist per history (raised per requirement)
   const persistThrottleMs = 2500;
+  // Remote push throttling & control
+  const remotePushThrottleMs = 10000; // 10s min interval unless forced
+  const lastRemotePushRef = useRef(0);
+  const lastRemoteSigRef = useRef("");
+  const remoteWriteDisabledRef = useRef(false);
   const lastPersistRef = useRef<number>(0);
   const windowSize = 24;
   // Expanded feature set: original 8 + avg OVER run length + avg BELOW run length (normalized)
@@ -28,18 +33,7 @@ export function useBinaryModel() {
   const batchSize = 32;
   const TRAIN_START = 10; // lowered (was 50) to begin CNN training earlier
   const TRAIN_EVERY = 3; // train every 3rd eligible sample
-  const [history, setHistory] = useState<number[]>(() => {
-    if (typeof window === "undefined") return [];
-    try {
-      const raw = localStorage.getItem(PKEY("bin_history"));
-      if (raw) {
-        const arr = JSON.parse(raw);
-        if (Array.isArray(arr))
-          return arr.slice(-PERSIST_LIMIT).filter((x) => x === 0 || x === 1);
-      }
-    } catch {}
-    return [];
-  });
+  const [history, setHistory] = useState<number[]>([]); // hydrate client-side
   interface OutcomeRecord {
     label: 0 | 1;
     predLabel: 0 | 1 | null;
@@ -50,17 +44,7 @@ export function useBinaryModel() {
     correct: boolean | null;
   }
 
-  const [records, setRecords] = useState<OutcomeRecord[]>(() => {
-    if (typeof window === "undefined") return [];
-    try {
-      const raw = localStorage.getItem(PKEY("bin_records"));
-      if (raw) {
-        const arr = JSON.parse(raw);
-        if (Array.isArray(arr)) return arr.slice(-PERSIST_LIMIT);
-      }
-    } catch {}
-    return [];
-  });
+  const [records, setRecords] = useState<OutcomeRecord[]>([]);
 
   // === Base binary model refs (restored shapes) ===
   const modelRef = useRef<tf.LayersModel | null>(null);
@@ -95,6 +79,30 @@ export function useBinaryModel() {
     correct: 0,
     total: 0,
   });
+  // Initial client hydration for histories/records (moved out of constructor to avoid SSR mismatch)
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const h = localStorage.getItem(PKEY("bin_history"));
+      if (h) {
+        const arr = JSON.parse(h);
+        if (Array.isArray(arr))
+          setHistory(
+            arr.slice(-PERSIST_LIMIT).filter((x: number) => x === 0 || x === 1)
+          );
+      }
+      const r = localStorage.getItem(PKEY("bin_records"));
+      if (r) {
+        const arr = JSON.parse(r);
+        if (Array.isArray(arr)) setRecords(arr.slice(-PERSIST_LIMIT));
+      }
+      const dr = localStorage.getItem(PKEY("dz_records"));
+      if (dr) {
+        const arr = JSON.parse(dr);
+        if (Array.isArray(arr)) setDozenRecords(arr.slice(-PERSIST_LIMIT));
+      }
+    } catch {}
+  }, []);
   // Dozens tracking state we reference later
   const [dozenRecords, setDozenRecords] = useState<
     {
@@ -103,17 +111,7 @@ export function useBinaryModel() {
       probs: [number, number, number];
       correct: boolean | null;
     }[]
-  >(() => {
-    if (typeof window === "undefined") return [];
-    try {
-      const raw = localStorage.getItem(PKEY("dz_records"));
-      if (raw) {
-        const arr = JSON.parse(raw);
-        if (Array.isArray(arr)) return arr.slice(-PERSIST_LIMIT);
-      }
-    } catch {}
-    return [];
-  });
+  >([]);
   const [dozenVersion, setDozenVersion] = useState(0);
   const dozenHiProbMissRateRef = useRef(0);
   const dozenLastHiProbMissRef = useRef(false);
@@ -123,7 +121,7 @@ export function useBinaryModel() {
   const [backend, setBackend] = useState<string | null>(null);
   // Remote persistence (Edge Config via /api/state) control refs & helpers (placed after state declarations)
   const remoteStateRef = useRef<{
-    status: "idle" | "loading" | "ready" | "error";
+    status: "idle" | "loading" | "ready" | "error" | "disabled";
     lastPull?: number;
     lastPush?: number;
     error?: string;
@@ -140,26 +138,15 @@ export function useBinaryModel() {
     backendInitPromiseRef.current = (async () => {
       await tf.ready();
       let selected = tf.getBackend();
-      if (!selected || selected === "cpu") {
+      const isWindows =
+        typeof navigator !== "undefined" &&
+        /Windows/i.test(navigator.userAgent || "");
+      if (!selected || selected === "cpu" || isWindows) {
         try {
-          const hasNavigatorGPU =
-            typeof navigator !== "undefined" && (navigator as any).gpu;
-          if (
-            hasNavigatorGPU &&
-            (tf as any).engine()?.registryFactory?.["webgpu"]
-          ) {
+          if (!isWindows && (tf as any).engine()?.registryFactory?.["webgpu"]) {
             try {
-              const adapter = await (navigator as any).gpu.requestAdapter?.();
-              if (
-                adapter &&
-                typeof (adapter as any).requestAdapterInfo === "function"
-              ) {
-                await tf.setBackend("webgpu");
-                selected = tf.getBackend();
-              } else {
-                await tf.setBackend("webgl");
-                selected = tf.getBackend();
-              }
+              await tf.setBackend("webgpu");
+              selected = tf.getBackend();
             } catch (e) {
               if (console && console.warn)
                 console.warn("WebGPU init failed, fallback to webgl", e);
@@ -171,7 +158,6 @@ export function useBinaryModel() {
             selected = tf.getBackend();
           }
         } catch {
-          // fallback remains whatever tf chose
           selected = tf.getBackend();
         }
       }
@@ -746,15 +732,16 @@ export function useBinaryModel() {
   const recomputePendingRef = useRef(false);
   const lastFrameRef = useRef<number | null>(null);
   const recomputeCurrentProb = useCallback(async () => {
-    // Throttle to one recompute per animation frame
+    // Throttle: allow at most one execution every 60ms ( ~16fps max )
     const nowFrame = typeof window !== "undefined" ? performance.now() : 0;
-    if (lastFrameRef.current && nowFrame - lastFrameRef.current < 12) {
+    if (lastFrameRef.current && nowFrame - lastFrameRef.current < 60) {
+      // mark a trailing run if skipped
       if (!recomputePendingRef.current) {
         recomputePendingRef.current = true;
-        requestAnimationFrame(() => {
+        setTimeout(() => {
           recomputePendingRef.current = false;
           recomputeCurrentProb();
-        });
+        }, 60);
       }
       return;
     }
@@ -1011,6 +998,24 @@ export function useBinaryModel() {
     recomputePendingRef.current = false;
   }, [history, windowSize, buildFeatureWindow, ensureModel]);
 
+  // Debounced recompute for control (UI) changes to avoid blocking every slider tick / toggle
+  const controlChangeDirtyRef = useRef(false);
+  const scheduleControlRecompute = useCallback(() => {
+    if (controlChangeDirtyRef.current) return; // already scheduled
+    controlChangeDirtyRef.current = true;
+    setTimeout(() => {
+      controlChangeDirtyRef.current = false;
+      // Use rAF to yield before heavy work
+      if (typeof requestAnimationFrame !== "undefined") {
+        requestAnimationFrame(() => {
+          recomputeCurrentProb();
+        });
+      } else {
+        recomputeCurrentProb();
+      }
+    }, 50); // collapse rapid sequences of changes
+  }, [recomputeCurrentProb]);
+
   const setControls = (partial: Partial<typeof controlsRef.current>) => {
     const keys = Object.keys(partial);
     Object.assign(controlsRef.current, partial);
@@ -1036,7 +1041,7 @@ export function useBinaryModel() {
         ].includes(k)
       )
     ) {
-      recomputeCurrentProb();
+      scheduleControlRecompute();
     }
     setControlsVersion((v) => v + 1); // force re-render for ref consumers
   };
@@ -1401,50 +1406,73 @@ export function useBinaryModel() {
     dozenHistory.length,
     dozenRecords.length,
   ]);
-  const pushRemote = useCallback(async () => {
-    if (pendingRemotePushRef.current) return;
-    pendingRemotePushRef.current = true;
-    try {
-      const payload = {
-        bin_history: history.slice(-PERSIST_LIMIT),
-        bin_records: records.slice(-PERSIST_LIMIT),
-        dz_history: dozenHistory.slice(-PERSIST_LIMIT),
-        dz_records: dozenRecords.slice(-PERSIST_LIMIT),
-        dz_state: {
-          rel: dozenReliabilityRef.current,
-          calib: dozenCalibAdjRef.current,
-        },
-        fullstate: {
-          v: 1,
-          ts: Date.now(),
-          history: history.slice(-PERSIST_LIMIT),
-          records: records.slice(-PERSIST_LIMIT),
-          dozenHistory: dozenHistory.slice(-PERSIST_LIMIT),
-          dozenRecords: dozenRecords.slice(-PERSIST_LIMIT),
-          controls: controlsRef.current,
-          rlWeights: rlWeightsRef.current,
-          lastPrediction: lastPredictionRef.current,
-          dozenPrediction: dozenPredictionRef.current,
-          dozenReliability: dozenReliabilityRef.current,
-          dozenCalib: dozenCalibAdjRef.current,
-          biasInfo,
-          metrics: metricsRef.current,
-        },
-      };
-      await fetch("/api/state", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-        keepalive: true,
-      });
-      remoteStateRef.current.lastPush = Date.now();
-      if (remoteStateRef.current.status === "idle")
-        remoteStateRef.current.status = "ready";
-    } catch {
-    } finally {
-      pendingRemotePushRef.current = false;
-    }
-  }, [history, records, dozenHistory, dozenRecords, biasInfo]);
+  const pushRemote = useCallback(
+    async (force: boolean = false) => {
+      if (remoteWriteDisabledRef.current) return;
+      const now = Date.now();
+      if (!force && now - lastRemotePushRef.current < remotePushThrottleMs)
+        return;
+      if (pendingRemotePushRef.current) return;
+      pendingRemotePushRef.current = true;
+      try {
+        const payload = {
+          bin_history: history.slice(-PERSIST_LIMIT),
+          bin_records: records.slice(-PERSIST_LIMIT),
+          dz_history: dozenHistory.slice(-PERSIST_LIMIT),
+          dz_records: dozenRecords.slice(-PERSIST_LIMIT),
+          dz_state: {
+            rel: dozenReliabilityRef.current,
+            calib: dozenCalibAdjRef.current,
+          },
+          fullstate: {
+            v: 1,
+            ts: now,
+            history: history.slice(-PERSIST_LIMIT),
+            records: records.slice(-PERSIST_LIMIT),
+            dozenHistory: dozenHistory.slice(-PERSIST_LIMIT),
+            dozenRecords: dozenRecords.slice(-PERSIST_LIMIT),
+            controls: controlsRef.current,
+            rlWeights: rlWeightsRef.current,
+            lastPrediction: lastPredictionRef.current,
+            dozenPrediction: dozenPredictionRef.current,
+            dozenReliability: dozenReliabilityRef.current,
+            dozenCalib: dozenCalibAdjRef.current,
+            biasInfo,
+            metrics: metricsRef.current,
+          },
+        };
+        const res = await fetch("/api/state", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          keepalive: true,
+        });
+        if (res.status === 501) {
+          remoteWriteDisabledRef.current = true;
+          remoteStateRef.current.status = "disabled";
+          return;
+        }
+        if (!res.ok) {
+          remoteStateRef.current.status = "error";
+          remoteStateRef.current.error = `push-failed-${res.status}`;
+          return;
+        }
+        lastRemotePushRef.current = now;
+        remoteStateRef.current.lastPush = now;
+        if (
+          remoteStateRef.current.status === "idle" ||
+          remoteStateRef.current.status === "error"
+        )
+          remoteStateRef.current.status = "ready";
+      } catch (e: any) {
+        remoteStateRef.current.status = "error";
+        remoteStateRef.current.error = e?.message || "push-exception";
+      } finally {
+        pendingRemotePushRef.current = false;
+      }
+    },
+    [history, records, dozenHistory, dozenRecords, biasInfo]
+  );
 
   // === DOZENS DECISION HELPERS ===
   const sampleDirichlet = (
@@ -3770,13 +3798,17 @@ export function useBinaryModel() {
     recomputePendingRef.current = false;
   };
 
-  // Unified persistence helper (local + remote) with optional force bypassing throttle
+  // Unified persistence helper (local + remote).
+  // localForce: bypass local debounce (e.g. critical state adjustments, unload)
+  // remoteForce: additionally bypass remote throttle (rare: manual save/unload)
   const persistAll = useCallback(
-    (force: boolean = false) => {
+    (localForce: boolean = false, opts?: { remoteForce?: boolean }) => {
       const now = Date.now();
-      if (!force && now - lastPersistRef.current <= persistThrottleMs) return;
+      if (!localForce && now - lastPersistRef.current <= persistThrottleMs)
+        return;
       lastPersistRef.current = now;
       try {
+        // LOCAL SNAPSHOTS
         localStorage.setItem(
           PKEY("dz_history"),
           JSON.stringify(dozenHistory.slice(-PERSIST_LIMIT))
@@ -3819,7 +3851,7 @@ export function useBinaryModel() {
         try {
           localStorage.setItem(PKEY("fullstate"), JSON.stringify(fullSnapshot));
         } catch {}
-        // save models (async fire & forget)
+        // Persist models (fire & forget)
         if (modelRef.current)
           modelRef.current
             .save(`localstorage://${PKEY("bin_model")}`)
@@ -3828,7 +3860,15 @@ export function useBinaryModel() {
           dozenModelRef.current
             .save(`localstorage://${PKEY("dz_model")}`)
             .catch(() => {});
-        pushRemote();
+        // REMOTE: push only if signature changed OR explicitly remoteForce
+        const sig = `${history.length}|${records.length}|${dozenHistory.length}|${dozenRecords.length}`;
+        const changed = sig !== lastRemoteSigRef.current;
+        const remoteForce = !!opts?.remoteForce;
+        if (remoteForce || changed) {
+          lastRemoteSigRef.current = sig;
+          // Only allow bypassing remote throttle when remoteForce true
+          pushRemote(remoteForce);
+        }
       } catch (e) {
         if (console && console.warn) console.warn("Persist save failed", e);
       }
@@ -3839,7 +3879,7 @@ export function useBinaryModel() {
   // Flush on page hide / unload to avoid throttle loss
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const handler = () => persistAll(true);
+    const handler = () => persistAll(true, { remoteForce: true });
     window.addEventListener("pagehide", handler);
     window.addEventListener("beforeunload", handler);
     document.addEventListener("visibilitychange", () => {
@@ -4008,6 +4048,172 @@ export function useBinaryModel() {
       for (let i = 0; i < 3; i++) dozenCalibAdjRef.current.mult[i] = 1;
     }
   }, []);
+
+  // === Auto-adjustment based on recommendation-style diagnostics ===
+  const autoSuggestionsRef = useRef<any[]>([]);
+  const autoTuneRef = useRef({
+    lastRun: 0,
+    counters: {} as Record<string, number>,
+  });
+  const MAX_LOOKBACK = 300;
+  const buildDiagAndSuggestions = useCallback(() => {
+    const mode = controlsRef.current.mode;
+    const variant = controlsRef.current.rouletteVariant;
+    // Build unified spins list similar to RecommendationPanel
+    type Spin = {
+      actual: number;
+      pred: number | null;
+      probs: number[];
+      win: boolean | null;
+    };
+    const spins: Spin[] = [];
+    if (mode === "roulette" && variant === "dozens") {
+      const src = dozenRecords.slice(-MAX_LOOKBACK);
+      src.forEach((r) => {
+        spins.push({
+          actual: typeof r.label === "number" ? r.label : 0,
+          pred: r.predLabel == null ? null : (r.predLabel as number),
+          probs:
+            r.probs && r.probs.length === 3 ? r.probs : [1 / 3, 1 / 3, 1 / 3],
+          win: r.correct,
+        });
+      });
+    } else {
+      const src = records.slice(-MAX_LOOKBACK);
+      src.forEach((r) => {
+        const p1 = r.prob == null ? 0.5 : r.prob;
+        spins.push({
+          actual: r.label ? 1 : 0,
+          pred: r.predLabel == null ? null : r.predLabel ? 1 : 0,
+          probs: [p1, 1 - p1],
+          win: r.correct,
+        });
+      });
+    }
+    const len = spins.length;
+    if (len < 10) return { suggestions: [] as any[] };
+    const topProbs = spins.map((s) => Math.max(...s.probs));
+    const avgTopProb = topProbs.reduce((a, b) => a + b, 0) / len;
+    const overallAcc =
+      spins.filter((s) => s.win).length /
+      (spins.filter((s) => s.win != null).length || 1);
+    const calibGap = avgTopProb - overallAcc; // positive => overconfident
+    let brierSum = 0;
+    spins.forEach((s) => {
+      for (let i = 0; i < s.probs.length; i++) {
+        const y = s.actual === i ? 1 : 0;
+        brierSum += (s.probs[i] - y) * (s.probs[i] - y);
+      }
+    });
+    const brier = brierSum / len;
+    // streak length actual
+    let streakLen = 0;
+    if (len) {
+      const last = spins[len - 1].actual;
+      for (let i = len - 1; i >= 0; i--) {
+        if (spins[i].actual === last) streakLen++;
+        else break;
+      }
+    }
+    // repeat misses on same prediction label
+    let missRepeat = 0;
+    if (len) {
+      const lastPred = spins[len - 1].pred;
+      if (lastPred != null) {
+        for (let i = len - 1; i >= 0; i--) {
+          if (spins[i].pred === lastPred) {
+            if (spins[i].win === false) missRepeat++;
+            else if (spins[i].win === true) break;
+          } else break;
+        }
+      }
+    }
+    const suggestions: any[] = [];
+    if (len > 30 && calibGap > 0.07) suggestions.push({ id: "overConfGap" });
+    if (len > 30 && calibGap < -0.07) suggestions.push({ id: "underConfGap" });
+    if (brier > 0.68 && len > 50) suggestions.push({ id: "brier" });
+    if (streakLen >= 4) suggestions.push({ id: "streak" });
+    if (streakLen >= 4 && avgTopProb < 0.45)
+      suggestions.push({ id: "reversalRisk" });
+    if (missRepeat >= 2) suggestions.push({ id: "missRepeat" });
+    return {
+      suggestions,
+      vars: { calibGap, brier, streakLen, missRepeat, avgTopProb },
+    };
+  }, [dozenRecords, records]);
+
+  const applyAutoAdjustments = useCallback(() => {
+    const now = Date.now();
+    if (now - autoTuneRef.current.lastRun < 1500) return; // rate limit
+    const { suggestions, vars } = buildDiagAndSuggestions();
+    autoSuggestionsRef.current = suggestions;
+    autoTuneRef.current.lastRun = now;
+    // update counters
+    suggestions.forEach((s) => {
+      autoTuneRef.current.counters[s.id] =
+        (autoTuneRef.current.counters[s.id] || 0) + 1;
+    });
+    // Mapping actions (mild & bounded)
+    const c = controlsRef.current;
+    const adj = (
+      k: keyof typeof c,
+      factor: number,
+      min: number,
+      max: number
+    ) => {
+      // @ts-ignore
+      c[k] = Math.min(max, Math.max(min, c[k] * factor));
+    };
+    const persistIfChanged = () => setControls({ ...controlsRef.current });
+    let changed = false;
+    suggestions.forEach((s) => {
+      const count = autoTuneRef.current.counters[s.id];
+      const strong = count >= 3 || ["brier"].includes(s.id);
+      switch (s.id) {
+        case "overConfGap":
+        case "brier":
+          if (strong) {
+            adj("wModel", 0.93, 0.3, 5);
+            adj("wPattern", 0.95, 0.3, 5);
+            adj("wEntropy", 1.07, 0, 5);
+            changed = true;
+          }
+          break;
+        case "underConfGap":
+          if (strong) {
+            adj("wModel", 1.07, 0.3, 5);
+            adj("wEntropy", 0.92, 0, 5);
+            changed = true;
+          }
+          break;
+        case "streak":
+          if (strong) {
+            adj("wStreak", 1.05, 0.2, 5);
+            changed = true;
+          }
+          break;
+        case "reversalRisk":
+          if (strong) {
+            adj("wStreak", 0.9, 0.2, 5);
+            adj("wPattern", 1.06, 0.2, 5);
+            changed = true;
+          }
+          break;
+        case "missRepeat":
+          if (strong) {
+            adj("wEntropy", 1.08, 0, 5);
+            adj("wPattern", 1.05, 0.2, 5);
+            changed = true;
+          }
+          break;
+      }
+    });
+    if (changed) persistAll(true); // local only; remote will sync on next length change
+  }, [buildDiagAndSuggestions, persistAll, setControls]);
+
+  useEffect(() => {
+    applyAutoAdjustments();
+  }, [records.length, dozenRecords.length, applyAutoAdjustments]);
 
   return {
     addObservation,
@@ -4550,6 +4756,10 @@ export function useBinaryModel() {
       abstain: dozenAbstainRef.current,
     },
     remoteState: remoteStateRef.current,
-    saveNow: () => persistAll(true),
+    saveNow: () => {
+      lastRemoteSigRef.current = ""; // force
+      persistAll(true, { remoteForce: true });
+    },
+    autoSuggestions: autoSuggestionsRef.current,
   };
 }

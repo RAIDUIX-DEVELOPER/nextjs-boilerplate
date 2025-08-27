@@ -47,10 +47,12 @@ export async function GET() {
 
 export async function POST(req: NextRequest) {
   if (!EDGE_CONFIG_ID || !EDGE_CONFIG_WRITE_TOKEN) {
-    return NextResponse.json(
-      { ok: false, error: "write-not-configured" },
-      { status: 501 }
-    );
+    // Treat as disabled (200) so client can stop retrying instead of logging 501 spam
+    return NextResponse.json({
+      ok: false,
+      disabled: true,
+      error: "write-not-configured",
+    });
   }
   let body: PersistPayload | null = null;
   try {

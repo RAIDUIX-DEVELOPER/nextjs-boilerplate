@@ -39,6 +39,9 @@ export const InputPanel: React.FC<Props> = ({ onSubmit, disabled }) => {
           disabled={disabled}
           placeholder="0.00"
           className="flex-1 bg-slate-800/60 border border-slate-600 focus:border-teal-400 focus:ring-0 rounded px-3 py-2 text-slate-100 placeholder-slate-500 text-sm outline-none"
+          name="trainValue"
+          id="trainValue"
+          autoComplete="off"
         />
         <button
           disabled={disabled || val === ""}

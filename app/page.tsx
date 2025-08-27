@@ -560,6 +560,11 @@ function StatsBar({
 }
 
 export default function Home() {
+  // Hydration guard to avoid SSR/client mismatch with dynamic, localStorage/remote-initialized data
+  const [mounted, setMounted] = React.useState(false);
+  React.useEffect(() => {
+    setMounted(true);
+  }, []);
   const {
     addObservation,
     addDozenObservation,
@@ -589,6 +594,14 @@ export default function Home() {
     remoteState,
     saveNow,
   } = useBinaryModel();
+
+  if (!mounted) {
+    return (
+      <div className="min-h-screen w-full bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 text-slate-400 flex items-center justify-center text-[11px]">
+        Initializing...
+      </div>
+    );
+  }
   const diagnostics = (() => {
     if (!probParts) return null;
     const sources = [

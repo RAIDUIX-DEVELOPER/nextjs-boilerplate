@@ -70,6 +70,8 @@ export function ControlPanel({
             value={controls.threshold}
             disabled
             className={sliderStyle}
+            name="threshold"
+            id="threshold-range"
           />
           <input
             type="number"
@@ -79,6 +81,8 @@ export function ControlPanel({
             value={controls.threshold}
             disabled
             className={numberBox}
+            name="thresholdValue"
+            id="threshold-number"
           />
         </Row>
         <Row
@@ -95,6 +99,8 @@ export function ControlPanel({
               setControls({ ewmaAlpha: parseFloat(e.target.value) })
             }
             className={sliderStyle}
+            name="ewmaAlpha"
+            id="ewmaAlpha-range"
           />
           <input
             type="number"
@@ -106,6 +112,8 @@ export function ControlPanel({
               setControls({ ewmaAlpha: parseFloat(e.target.value) || 0 })
             }
             className={numberBox}
+            name="ewmaAlphaValue"
+            id="ewmaAlpha-number"
           />
         </Row>
         <Row
@@ -120,6 +128,8 @@ export function ControlPanel({
             value={controls.rlEta}
             onChange={(e) => setControls({ rlEta: parseFloat(e.target.value) })}
             className={sliderStyle}
+            name="rlEta"
+            id="rlEta-range"
           />
           <input
             type="number"
@@ -131,6 +141,8 @@ export function ControlPanel({
               setControls({ rlEta: parseFloat(e.target.value) || 0 })
             }
             className={numberBox}
+            name="rlEtaValue"
+            id="rlEta-number"
           />
         </Row>
         <Row
@@ -141,6 +153,8 @@ export function ControlPanel({
             type="checkbox"
             checked={controls.rlEnabled}
             onChange={(e) => setControls({ rlEnabled: e.target.checked })}
+            name="rlEnabled"
+            id="rlEnabled-checkbox"
           />
         </Row>
         <Row
@@ -151,6 +165,8 @@ export function ControlPanel({
             type="checkbox"
             checked={controls.antiStreak}
             onChange={(e) => setControls({ antiStreak: e.target.checked })}
+            name="antiStreak"
+            id="antiStreak-checkbox"
           />
         </Row>
         <Row
@@ -161,6 +177,8 @@ export function ControlPanel({
             type="checkbox"
             checked={controls.invertStrategy}
             onChange={(e) => setControls({ invertStrategy: e.target.checked })}
+            name="invertStrategy"
+            id="invertStrategy-checkbox"
           />
         </Row>
         <Row
@@ -173,6 +191,8 @@ export function ControlPanel({
             onChange={(e) =>
               setControls({ mode: e.target.checked ? "roulette" : "binary" })
             }
+            name="rouletteMode"
+            id="rouletteMode-checkbox"
           />
         </Row>
         {controls.mode === "roulette" && (
@@ -184,6 +204,8 @@ export function ControlPanel({
               value={controls.rouletteVariant}
               onChange={(e) => setControls({ rouletteVariant: e.target.value })}
               className="bg-slate-900/70 border border-slate-600 rounded px-2 py-1 text-[11px]"
+              name="rouletteVariant"
+              id="rouletteVariant-select"
             >
               <option value="redblack">Red/Black</option>
               <option value="dozens">Dozens</option>
@@ -220,6 +242,7 @@ export function ControlPanel({
                 </>
               )}
               {remoteState.status === "error" && "sync error"}
+              {remoteState.status === "disabled" && "remote disabled"}
             </span>
           )}
         </div>
@@ -242,6 +265,8 @@ export function ControlPanel({
               setControls({ wModel: parseFloat(e.target.value) })
             }
             className={sliderStyle}
+            name="wModel"
+            id="wModel-range"
           />
           <input
             type="number"
@@ -253,6 +278,8 @@ export function ControlPanel({
               setControls({ wModel: parseFloat(e.target.value) || 0 })
             }
             className={numberBox}
+            name="wModelValue"
+            id="wModel-number"
           />
         </Row>
         <Row
@@ -269,6 +296,8 @@ export function ControlPanel({
               setControls({ wMarkov: parseFloat(e.target.value) })
             }
             className={sliderStyle}
+            name="wMarkov"
+            id="wMarkov-range"
           />
           <input
             type="number"
@@ -280,6 +309,8 @@ export function ControlPanel({
               setControls({ wMarkov: parseFloat(e.target.value) || 0 })
             }
             className={numberBox}
+            name="wMarkovValue"
+            id="wMarkov-number"
           />
         </Row>
         <Row
@@ -296,6 +327,8 @@ export function ControlPanel({
               setControls({ wStreak: parseFloat(e.target.value) })
             }
             className={sliderStyle}
+            name="wStreak"
+            id="wStreak-range"
           />
           <input
             type="number"
@@ -307,6 +340,8 @@ export function ControlPanel({
               setControls({ wStreak: parseFloat(e.target.value) || 0 })
             }
             className={numberBox}
+            name="wStreakValue"
+            id="wStreak-number"
           />
         </Row>
         <Row
@@ -323,6 +358,8 @@ export function ControlPanel({
               setControls({ wPattern: parseFloat(e.target.value) })
             }
             className={sliderStyle}
+            name="wPattern"
+            id="wPattern-range"
           />
           <input
             type="number"
@@ -334,6 +371,8 @@ export function ControlPanel({
               setControls({ wPattern: parseFloat(e.target.value) || 0 })
             }
             className={numberBox}
+            name="wPatternValue"
+            id="wPattern-number"
           />
         </Row>
         <Row
@@ -348,6 +387,8 @@ export function ControlPanel({
             value={controls.wEwma}
             onChange={(e) => setControls({ wEwma: parseFloat(e.target.value) })}
             className={sliderStyle}
+            name="wEwma"
+            id="wEwma-range"
           />
           <input
             type="number"
@@ -359,6 +400,8 @@ export function ControlPanel({
               setControls({ wEwma: parseFloat(e.target.value) || 0 })
             }
             className={numberBox}
+            name="wEwmaValue"
+            id="wEwma-number"
           />
         </Row>
         <Row
@@ -375,6 +418,8 @@ export function ControlPanel({
               setControls({ wBayes: parseFloat(e.target.value) })
             }
             className={sliderStyle}
+            name="wBayes"
+            id="wBayes-range"
           />
           <input
             type="number"
@@ -386,6 +431,8 @@ export function ControlPanel({
               setControls({ wBayes: parseFloat(e.target.value) || 0 })
             }
             className={numberBox}
+            name="wBayesValue"
+            id="wBayes-number"
           />
         </Row>
         <Row
@@ -402,6 +449,8 @@ export function ControlPanel({
               setControls({ wEntropy: parseFloat(e.target.value) })
             }
             className={sliderStyle}
+            name="wEntropy"
+            id="wEntropy-range"
           />
           <input
             type="number"
@@ -413,6 +462,8 @@ export function ControlPanel({
               setControls({ wEntropy: parseFloat(e.target.value) || 0 })
             }
             className={numberBox}
+            name="wEntropyValue"
+            id="wEntropy-number"
           />
         </Row>
         <Row
@@ -429,6 +480,8 @@ export function ControlPanel({
                 setControls({ bayesPriorA: parseFloat(e.target.value) || 0 })
               }
               className={numberBox}
+              name="bayesPriorA"
+              id="bayesPriorA"
             />
             <span className="text-slate-500">/</span>
             <input
@@ -440,6 +493,8 @@ export function ControlPanel({
                 setControls({ bayesPriorB: parseFloat(e.target.value) || 0 })
               }
               className={numberBox}
+              name="bayesPriorB"
+              id="bayesPriorB"
             />
           </div>
         </Row>
@@ -457,6 +512,8 @@ export function ControlPanel({
               setControls({ entropyWindow: parseInt(e.target.value, 10) })
             }
             className={sliderStyle}
+            name="entropyWindow"
+            id="entropyWindow-range"
           />
           <input
             type="number"
@@ -468,6 +525,8 @@ export function ControlPanel({
               setControls({ entropyWindow: parseInt(e.target.value, 10) || 5 })
             }
             className={numberBox}
+            name="entropyWindowValue"
+            id="entropyWindow-number"
           />
         </Row>
         <p className="text-[10px] text-slate-500 leading-snug">
