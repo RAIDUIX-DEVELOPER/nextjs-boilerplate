@@ -26,6 +26,7 @@ export async function GET() {
       "dz_history",
       "dz_records",
       "dz_state",
+      "fullstate",
     ];
     const out: Record<string, any> = {};
     for (const k of keys) {
@@ -71,6 +72,7 @@ export async function POST(req: NextRequest) {
     dz_history: body.dz_history,
     dz_records: body.dz_records,
     dz_state: body.dz_state,
+    fullstate: (body as any).fullstate,
   };
   for (const [k, v] of Object.entries(map))
     if (v !== undefined) items.push({ op: "upsert", key: k, value: v });

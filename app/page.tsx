@@ -586,6 +586,8 @@ export default function Home() {
     controlsVersion,
     rouletteDozenAdaptive,
     rouletteDozenExtended,
+    remoteState,
+    saveNow,
   } = useBinaryModel();
   const diagnostics = (() => {
     if (!probParts) return null;
@@ -821,6 +823,8 @@ export default function Home() {
             rlWeights={rlWeights}
             resetModel={resetModel}
             loading={loading}
+            saveNow={saveNow}
+            remoteState={remoteState}
           />
         </section>
         <footer className="mt-12 text-center text-[10px] text-slate-600 space-y-1">

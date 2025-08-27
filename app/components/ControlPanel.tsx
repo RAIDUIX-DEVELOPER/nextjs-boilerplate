@@ -15,6 +15,8 @@ interface ControlPanelProps {
   };
   resetModel: () => void;
   loading: boolean;
+  saveNow?: () => void;
+  remoteState?: { status: string; lastPush?: number; lastPull?: number };
 }
 
 const sliderStyle = "w-full cursor-pointer accent-teal-400";
@@ -30,6 +32,8 @@ export function ControlPanel({
   rlWeights,
   resetModel,
   loading,
+  saveNow,
+  remoteState,
 }: ControlPanelProps) {
   const Row = ({
     label,
@@ -193,6 +197,32 @@ export function ControlPanel({
         >
           Reset
         </button>
+        <div className="mt-2 flex items-center gap-2">
+          <button
+            onClick={() => saveNow && saveNow()}
+            disabled={loading || !saveNow}
+            className="text-xs px-2 py-1.5 rounded border border-teal-600/60 text-teal-300 hover:border-teal-400 hover:text-teal-200 disabled:opacity-40"
+            title="Force immediate persist to local + remote store"
+          >
+            Save Now
+          </button>
+          {remoteState && (
+            <span className="text-[9px] text-slate-500">
+              {remoteState.status === "loading" && "syncing..."}
+              {remoteState.status === "ready" && (
+                <>
+                  last push{" "}
+                  {remoteState.lastPush
+                    ? Math.round((Date.now() - remoteState.lastPush) / 1000) +
+                      "s"
+                    : "—"}{" "}
+                  ago
+                </>
+              )}
+              {remoteState.status === "error" && "sync error"}
+            </span>
+          )}
+        </div>
       </div>
       <div className={groupCard}>
         <h3 className="text-xs font-semibold text-slate-200 tracking-wide">

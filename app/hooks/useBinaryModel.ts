@@ -1414,6 +1414,22 @@ export function useBinaryModel() {
           rel: dozenReliabilityRef.current,
           calib: dozenCalibAdjRef.current,
         },
+        fullstate: {
+          v: 1,
+          ts: Date.now(),
+          history: history.slice(-PERSIST_LIMIT),
+          records: records.slice(-PERSIST_LIMIT),
+          dozenHistory: dozenHistory.slice(-PERSIST_LIMIT),
+          dozenRecords: dozenRecords.slice(-PERSIST_LIMIT),
+          controls: controlsRef.current,
+          rlWeights: rlWeightsRef.current,
+          lastPrediction: lastPredictionRef.current,
+          dozenPrediction: dozenPredictionRef.current,
+          dozenReliability: dozenReliabilityRef.current,
+          dozenCalib: dozenCalibAdjRef.current,
+          biasInfo,
+          metrics: metricsRef.current,
+        },
       };
       await fetch("/api/state", {
         method: "POST",
@@ -1428,7 +1444,7 @@ export function useBinaryModel() {
     } finally {
       pendingRemotePushRef.current = false;
     }
-  }, [history, records, dozenHistory, dozenRecords]);
+  }, [history, records, dozenHistory, dozenRecords, biasInfo]);
 
   // === DOZENS DECISION HELPERS ===
   const sampleDirichlet = (
@@ -4162,75 +4178,8 @@ export function useBinaryModel() {
               factor: 1.2 + severity * 0.6, // 1.2 - 1.8
             };
           }
-          // === Persistence (throttled) ===
-          const now = Date.now();
-          if (now - lastPersistRef.current > persistThrottleMs) {
-            lastPersistRef.current = now;
-            try {
-              // histories & records
-              localStorage.setItem(
-                PKEY("dz_history"),
-                JSON.stringify(dozenHistory.slice(-PERSIST_LIMIT))
-              );
-              localStorage.setItem(
-                PKEY("dz_records"),
-                JSON.stringify(dozenRecords.slice(-PERSIST_LIMIT))
-              );
-              localStorage.setItem(
-                PKEY("bin_history"),
-                JSON.stringify(history.slice(-PERSIST_LIMIT))
-              );
-              localStorage.setItem(
-                PKEY("bin_records"),
-                JSON.stringify(records.slice(-PERSIST_LIMIT))
-              );
-              // adaptive state snapshot
-              localStorage.setItem(
-                PKEY("dz_state"),
-                JSON.stringify({
-                  rel: dozenReliabilityRef.current,
-                  calib: dozenCalibAdjRef.current,
-                })
-              );
-              // full comprehensive snapshot
-              const fullSnapshot = {
-                v: 1,
-                ts: Date.now(),
-                history: history.slice(-PERSIST_LIMIT),
-                records: records.slice(-PERSIST_LIMIT),
-                dozenHistory: dozenHistory.slice(-PERSIST_LIMIT),
-                dozenRecords: dozenRecords.slice(-PERSIST_LIMIT),
-                controls: controlsRef.current,
-                rlWeights: rlWeightsRef.current,
-                lastPrediction: lastPredictionRef.current,
-                dozenPrediction: dozenPredictionRef.current,
-                dozenReliability: dozenReliabilityRef.current,
-                dozenCalib: dozenCalibAdjRef.current,
-                biasInfo,
-                metrics: metricsRef.current,
-              };
-              try {
-                localStorage.setItem(
-                  PKEY("fullstate"),
-                  JSON.stringify(fullSnapshot)
-                );
-              } catch {}
-              // save models (async, fire & forget)
-              if (modelRef.current)
-                modelRef.current
-                  .save(`localstorage://${PKEY("bin_model")}`)
-                  .catch(() => {});
-              if (dozenModelRef.current)
-                dozenModelRef.current
-                  .save(`localstorage://${PKEY("dz_model")}`)
-                  .catch(() => {});
-              // Remote push (fire & forget)
-              pushRemote();
-            } catch (e) {
-              if (console && console.warn)
-                console.warn("Persist save failed", e);
-            }
-          }
+          // Persistence now centralized (throttled inside persistAll)
+          persistAll();
           // Shock activation: three hi-prob misses (>=0.6) within last 12 qualifying events OR miss rate >0.65 over last 20
           const shock = dozenShockRef.current as any;
           const recentQual = dozenHiProbEventsRef.current.slice(-20);
@@ -4601,5 +4550,6 @@ export function useBinaryModel() {
       abstain: dozenAbstainRef.current,
     },
     remoteState: remoteStateRef.current,
+    saveNow: () => persistAll(true),
   };
 }
