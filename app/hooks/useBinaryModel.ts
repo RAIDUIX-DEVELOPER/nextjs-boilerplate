@@ -28,7 +28,18 @@ export function useBinaryModel() {
   const batchSize = 32;
   const TRAIN_START = 10; // lowered (was 50) to begin CNN training earlier
   const TRAIN_EVERY = 3; // train every 3rd eligible sample
-  const [history, setHistory] = useState<number[]>([]);
+  const [history, setHistory] = useState<number[]>(() => {
+    if (typeof window === "undefined") return [];
+    try {
+      const raw = localStorage.getItem(PKEY("bin_history"));
+      if (raw) {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr))
+          return arr.slice(-PERSIST_LIMIT).filter((x) => x === 0 || x === 1);
+      }
+    } catch {}
+    return [];
+  });
   interface OutcomeRecord {
     label: 0 | 1;
     predLabel: 0 | 1 | null;
@@ -39,7 +50,17 @@ export function useBinaryModel() {
     correct: boolean | null;
   }
 
-  const [records, setRecords] = useState<OutcomeRecord[]>([]);
+  const [records, setRecords] = useState<OutcomeRecord[]>(() => {
+    if (typeof window === "undefined") return [];
+    try {
+      const raw = localStorage.getItem(PKEY("bin_records"));
+      if (raw) {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr)) return arr.slice(-PERSIST_LIMIT);
+      }
+    } catch {}
+    return [];
+  });
 
   // === Base binary model refs (restored shapes) ===
   const modelRef = useRef<tf.LayersModel | null>(null);
@@ -82,7 +103,17 @@ export function useBinaryModel() {
       probs: [number, number, number];
       correct: boolean | null;
     }[]
-  >([]);
+  >(() => {
+    if (typeof window === "undefined") return [];
+    try {
+      const raw = localStorage.getItem(PKEY("dz_records"));
+      if (raw) {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr)) return arr.slice(-PERSIST_LIMIT);
+      }
+    } catch {}
+    return [];
+  });
   const [dozenVersion, setDozenVersion] = useState(0);
   const dozenHiProbMissRateRef = useRef(0);
   const dozenLastHiProbMissRef = useRef(false);
@@ -151,7 +182,20 @@ export function useBinaryModel() {
     await backendInitPromiseRef.current;
   }, [backend]);
   // Roulette dozens mode state (separate simple frequency tracker)
-  const [dozenHistory, setDozenHistory] = useState<(0 | 1 | 2)[]>([]);
+  const [dozenHistory, setDozenHistory] = useState<(0 | 1 | 2)[]>(() => {
+    if (typeof window === "undefined") return [];
+    try {
+      const raw = localStorage.getItem(PKEY("dz_history"));
+      if (raw) {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr))
+          return arr
+            .slice(-PERSIST_LIMIT)
+            .filter((x: any) => x === 0 || x === 1 || x === 2);
+      }
+    } catch {}
+    return [];
+  });
   const dozenProbsRef = useRef<[number, number, number] | null>(null);
   // Multi-class (dozens) model & tracking
   const dozenModelRef = useRef<tf.LayersModel | null>(null);
@@ -3709,6 +3753,87 @@ export function useBinaryModel() {
     lastTrainCountRef.current = 0;
     recomputePendingRef.current = false;
   };
+
+  // Unified persistence helper (local + remote) with optional force bypassing throttle
+  const persistAll = useCallback(
+    (force: boolean = false) => {
+      const now = Date.now();
+      if (!force && now - lastPersistRef.current <= persistThrottleMs) return;
+      lastPersistRef.current = now;
+      try {
+        localStorage.setItem(
+          PKEY("dz_history"),
+          JSON.stringify(dozenHistory.slice(-PERSIST_LIMIT))
+        );
+        localStorage.setItem(
+          PKEY("dz_records"),
+          JSON.stringify(dozenRecords.slice(-PERSIST_LIMIT))
+        );
+        localStorage.setItem(
+          PKEY("bin_history"),
+          JSON.stringify(history.slice(-PERSIST_LIMIT))
+        );
+        localStorage.setItem(
+          PKEY("bin_records"),
+          JSON.stringify(records.slice(-PERSIST_LIMIT))
+        );
+        localStorage.setItem(
+          PKEY("dz_state"),
+          JSON.stringify({
+            rel: dozenReliabilityRef.current,
+            calib: dozenCalibAdjRef.current,
+          })
+        );
+        const fullSnapshot = {
+          v: 1,
+          ts: Date.now(),
+          history: history.slice(-PERSIST_LIMIT),
+          records: records.slice(-PERSIST_LIMIT),
+          dozenHistory: dozenHistory.slice(-PERSIST_LIMIT),
+          dozenRecords: dozenRecords.slice(-PERSIST_LIMIT),
+          controls: controlsRef.current,
+          rlWeights: rlWeightsRef.current,
+          lastPrediction: lastPredictionRef.current,
+          dozenPrediction: dozenPredictionRef.current,
+          dozenReliability: dozenReliabilityRef.current,
+          dozenCalib: dozenCalibAdjRef.current,
+          biasInfo,
+          metrics: metricsRef.current,
+        };
+        try {
+          localStorage.setItem(PKEY("fullstate"), JSON.stringify(fullSnapshot));
+        } catch {}
+        // save models (async fire & forget)
+        if (modelRef.current)
+          modelRef.current
+            .save(`localstorage://${PKEY("bin_model")}`)
+            .catch(() => {});
+        if (dozenModelRef.current)
+          dozenModelRef.current
+            .save(`localstorage://${PKEY("dz_model")}`)
+            .catch(() => {});
+        pushRemote();
+      } catch (e) {
+        if (console && console.warn) console.warn("Persist save failed", e);
+      }
+    },
+    [biasInfo, dozenHistory, dozenRecords, history, records, pushRemote]
+  );
+
+  // Flush on page hide / unload to avoid throttle loss
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handler = () => persistAll(true);
+    window.addEventListener("pagehide", handler);
+    window.addEventListener("beforeunload", handler);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") handler();
+    });
+    return () => {
+      window.removeEventListener("pagehide", handler);
+      window.removeEventListener("beforeunload", handler);
+    };
+  }, [persistAll]);
 
   useEffect(() => {
     (async () => {
